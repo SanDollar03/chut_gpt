@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>ChuっとGPT</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+
+<body>
+    <div class="layout">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-mark">💋</div>
+                <div class="brand-text">ChuっとGPT</div>
+            </div>
+
+            <div class="block">
+                <div class="label">モデル</div>
+                <div id="modelDropdown" class="dropdown">
+                    <button id="modelBtn" type="button" class="dropdown-btn">
+                        <span id="modelBtnText">読み込み中…</span>
+                        <span class="dropdown-arrow">▽</span>
+                    </button>
+                    <div id="modelMenu" class="dropdown-menu" hidden></div>
+                </div>
+            </div>
+
+            <div class="block">
+                <button id="newChatBtn" class="btn primary" type="button">新しいチャット</button>
+            </div>
+
+            <div class="conv-head">
+                <div>あなたのチャット</div>
+            </div>
+            <div id="convList" class="conv-list"></div>
+
+            <div class="sidebar-meta">
+                <div class="sidebar-user">ID: {{ user_id }}</div>
+                <form method="post" action="/logout">
+                    <button class="sidebar-logout" type="submit">ログアウト</button>
+                </form>
+            </div>
+        </aside>
+
+        <div class="main">
+            <header class="topbar">
+                <div class="topbar-title">ChuっとGPT💋 ver.2.0.0</div>
+                <div class="topbar-sub">Akira Takasugi</div>
+            </header>
+
+            <main id="chat" class="chat"></main>
+
+            <form id="form" class="composer">
+                <input id="input" type="text" placeholder="メッセージを入力…" autocomplete="off" />
+                <button id="send" type="submit">送信</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+    <script src="/static/app.js"></script>
+</body>
+
+</html>

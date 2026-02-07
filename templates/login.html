@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ja">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Login - ChuっとGPT</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+
+<body>
+    <div class="auth">
+        <div class="auth-card">
+            <div class="auth-title">💋 ChuっとGPT</div>
+            <div class="auth-sub">ログイン</div>
+
+            {% if error %}
+            <div class="auth-error">{{ error }}</div>
+            {% endif %}
+
+            <form method="post" action="/login" class="auth-form">
+                <label>ID（数字7桁）</label>
+                <input name="user_id" inputmode="numeric" pattern="\d{7}" maxlength="7" value="{{ user_id or '' }}"
+                    required />
+
+                <label>パスワード</label>
+                <input name="password" type="password" required />
+
+                <button type="submit">ログイン</button>
+            </form>
+
+            <div class="auth-footer">
+                <a href="/register">新規登録へ</a>
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>
