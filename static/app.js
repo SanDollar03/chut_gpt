@@ -13,7 +13,11 @@
     const modelBtnText = document.getElementById("modelBtnText");
     const modelMenu = document.getElementById("modelMenu");
 
-    if (!chat || !form || !input || !send || !newChatBtn || !convList || !toast || !modelBtn || !modelBtnText || !modelMenu) {
+    if (
+        !chat || !form || !input || !send ||
+        !newChatBtn || !convList || !toast ||
+        !modelBtn || !modelBtnText || !modelMenu
+    ) {
         return;
     }
 
@@ -56,6 +60,12 @@
         localStorage.setItem(activeThreadKey(), activeThreadId || "");
     };
     const loadActiveThread = () => (localStorage.getItem(activeThreadKey()) || "").trim() || null;
+
+    // ★追加：送信前に必ず thread_id を確定させる（meta/done取りこぼし保険）
+    function newThreadId() {
+        if (window.crypto?.randomUUID) return crypto.randomUUID().replaceAll("-", "");
+        return (Date.now().toString(16) + Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)).slice(0, 32);
+    }
 
     // ----------------------------
     // API fetch (401 -> login)
@@ -231,7 +241,6 @@
         }
 
         if (items.length === 0) {
-            // ここで greeting に戻るのは「本当に空」のときだけ
             renderEmptyChat();
         }
     }
@@ -262,22 +271,26 @@
             closeAnyMenu();
             const next = prompt("新しい名前", it.name || it.preview || "");
             if (!next) return;
+
             await apiFetch("/api/threads/rename", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ thread_id: it.thread_id, name: next })
             });
+
             await loadThreads();
         });
 
         btnDelete.addEventListener("click", async () => {
             closeAnyMenu();
             if (!confirm("このチャットを削除しますか？（履歴も削除されます）")) return;
+
             await apiFetch("/api/threads/delete", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ thread_id: it.thread_id })
             });
+
             if (activeThreadId === it.thread_id) setActiveThread(null);
             await loadThreads();
             await loadHistory();
@@ -334,7 +347,6 @@
             more.type = "button";
             more.textContent = "・・・";
 
-            // ★ここ重要：クリックしたスレを必ずアクティブにしてから履歴ロード
             left.addEventListener("click", async () => {
                 setActiveThread(it.thread_id);
                 await loadHistory();
@@ -355,8 +367,9 @@
     // ----------------------------
     // New Chat: hard reset
     // ----------------------------
+    // ★安定化：新しいチャット押下時点で thread_id を作って確定
     newChatBtn.addEventListener("click", async () => {
-        setActiveThread(null);
+        setActiveThread(newThreadId());
         renderEmptyChat();
         showToast("新しいチャットを開始しました");
         await loadThreads();
@@ -373,7 +386,6 @@
     }
 
     function splitSseBlocks(buffer) {
-        // \n\n / \r\n\r\n 両対応
         const parts = buffer.split(/\r?\n\r?\n/);
         return { blocks: parts.slice(0, -1), rest: parts[parts.length - 1] || "" };
     }
@@ -385,7 +397,6 @@
         if (dataLines.length === 0) return null;
 
         const eventName = evLine ? evLine.replace("event:", "").trim() : "message";
-        // data: が複数行のとき結合
         const dataStr = dataLines.map(l => l.replace("data:", "").trim()).join("\n");
 
         let ev;
@@ -394,6 +405,11 @@
     }
 
     async function streamChat(message) {
+        // ★最重要：送信前に thread_id を必ず確定（meta/done取りこぼしでも崩れない）
+        if (!activeThreadId) {
+            setActiveThread(newThreadId());
+        }
+
         // まずユーザ発言を表示
         addMsg({ role: "user", text: message, modelKey: "", timeISO: "", showModelTag: false, showTime: false });
 
@@ -440,7 +456,7 @@
 
                 const { eventName, ev } = parsed;
 
-                // ★最重要：metaで thread_id を必ず確定（done待ちしない）
+                // metaが来たら thread_id を上書きして同期（サーバ採番でも整合）
                 if (eventName === "meta") {
                     if (ev.thread_id) setActiveThread(ev.thread_id);
                     continue;
@@ -474,12 +490,10 @@
 
         // streamがdone無しで閉じた時の保険：リセットせず復元を試みる
         if (!gotDone) {
-            // thread_id は meta で入っているはず
             await loadThreads();
             if (activeThreadId) {
                 await loadHistory();
             } else {
-                // それでも無ければ、今表示している内容を保持して終了（リセットしない）
                 botBubble.classList.add("warn");
             }
         }
