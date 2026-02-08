@@ -25,7 +25,6 @@ body {
     background: var(--bg);
     color: var(--text);
     font-size: 13px;
-    /* ④ 少し小さく */
 }
 
 /* =====================================
@@ -63,7 +62,6 @@ body {
     letter-spacing: .3px;
 }
 
-/* model select + buttons theme unify */
 .block {
     padding: 0 8px;
 }
@@ -74,7 +72,6 @@ body {
     margin-bottom: 6px;
 }
 
-.select,
 .btn,
 .sidebar-logout {
     width: 100%;
@@ -84,10 +81,6 @@ body {
     color: var(--text);
     border: 1px solid var(--input-line);
     outline: none;
-}
-
-.select {
-    appearance: none;
 }
 
 .btn {
@@ -164,10 +157,14 @@ body {
     cursor: pointer;
 }
 
-.conv-title {
-    font-weight: 800;
-    font-size: 13px;
+.conv-preview {
+    margin-top: 6px;
+    opacity: .82;
+    font-size: 12px;
     line-height: 1.25;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .conv-meta {
@@ -183,24 +180,19 @@ body {
     padding: 0;
     border-radius: 10px;
     background: transparent;
-    /* 透明 */
     border: 0;
-    /* 枠なし */
     color: var(--text);
     cursor: pointer;
     font-size: 18px;
-    /* …を見やすく */
     line-height: 1;
     opacity: .85;
 }
 
 .conv-more:hover {
     background: rgba(255, 255, 255, .06);
-    /* ホバーだけ薄く */
     opacity: 1;
 }
 
-/* 保存対象を一瞬ハイライト */
 .conv-item.flash {
     outline: 2px solid rgba(34, 197, 94, .55);
     background: rgba(34, 197, 94, .10);
@@ -289,6 +281,7 @@ body {
     justify-content: flex-start;
 }
 
+/* --- normal bubble --- */
 .bubble {
     max-width: min(720px, 90%);
     padding: 10px 12px;
@@ -297,6 +290,9 @@ body {
     white-space: pre-wrap;
     word-break: break-word;
     position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
 }
 
 .msg.user .bubble {
@@ -307,7 +303,6 @@ body {
 
 .msg.bot .bubble {
     background: rgba(255, 255, 255, .08);
-    /* ①色分けしない */
     border: 1px solid rgba(255, 255, 255, .08);
     border-bottom-left-radius: 6px;
 }
@@ -318,15 +313,18 @@ body {
     line-height: 1;
     padding: 6px 8px;
     border-radius: 999px;
-    margin-right: 8px;
-    margin-bottom: 6px;
+    margin: 0 0 2px 0;
     opacity: .95;
     border: 1px solid rgba(255, 255, 255, .14);
     background: rgba(255, 255, 255, .06);
 }
 
 .bubble-text {
-    display: block;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    margin: 0;
+    padding: 0;
 }
 
 .msg-time {
@@ -334,7 +332,22 @@ body {
     font-size: 11px;
     opacity: .65;
     text-align: right;
-    /* ②右下 */
+}
+
+/* --- GIF only row (NO bubble) --- */
+.msg.bot.gif-only {
+    padding: 0;
+    margin: 0;
+    align-items: flex-start;
+}
+
+/* 元 480x270 → 1/4 = 幅120（高さautoで約68） */
+.thinking-gif {
+    display: block;
+    width: 120px;
+    height: auto;
+    margin: 0;
+    padding: 0;
 }
 
 /* =====================================
@@ -374,7 +387,7 @@ body {
 }
 
 /* =====================================
-   Toast (①)
+   Toast
 ===================================== */
 .toast {
     position: fixed;
@@ -478,23 +491,14 @@ body {
     text-decoration: none;
 }
 
-.conv-preview {
-    margin-top: 6px;
-    opacity: .82;
-    font-size: 12px;
-    line-height: 1.25;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-/* ③ select展開（option）の配色：ダーク背景＋白文字（効く範囲はブラウザ依存） */
 select option {
     background: #0b0f19;
     color: #e7eaf0;
 }
 
-/* dropdown */
+/* =====================================
+   Dropdown (モデル)
+===================================== */
 .dropdown {
     position: relative;
 }
@@ -561,7 +565,7 @@ select option {
 }
 
 /* =====================================
-   Current Model status bar (①)
+   Current Model status bar
 ===================================== */
 .model-status {
     display: flex;
@@ -612,7 +616,7 @@ select option {
 }
 
 /* =====================================
-   Modal (②③)
+   Modal (notice)
 ===================================== */
 .modal {
     position: fixed;
@@ -651,7 +655,6 @@ select option {
     padding: 14px 16px;
     overflow: auto;
     white-space: pre-wrap;
-    /* テキストの改行を保持 */
     line-height: 1.6;
     font-size: 12px;
     opacity: .92;
