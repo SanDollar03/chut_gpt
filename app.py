@@ -3,7 +3,8 @@ import re
 import csv
 import json
 import uuid
-from datetime import datetime
+import io
+from datetime import datetime, timedelta
 from functools import wraps
 from typing import Dict, Any, Iterable, Optional, List
 
@@ -41,6 +42,27 @@ USER_FIELDS = ["user_id", "password", "model_key", "created_at"]
 HISTORY_FIELDS = ["timestamp", "role", "model_key", "thread_id", "dify_conversation_id", "content"]
 THREAD_FIELDS = ["thread_id", "name", "preview", "created_at", "updated_at"]
 MAP_FIELDS = ["thread_id", "model_key", "dify_conversation_id", "updated_at"]
+
+# ---- Notice text (editable) ----
+NOTICE_PATH = os.path.join(BASE_DIR, "notice.txt")
+
+DEFAULT_NOTICE_TEXT = """【更新履歴 / 注意事項】
+・モデルを切り替えると、用途に合わせて回答傾向が変わります。質問の前に「現在のモデル」を確認してください。
+
+【注意事項】
+・ChuっとGPTの回答は必ず正しいとは限りません。重要な情報は必ず確認してください。
+・会話ログはサーバー負荷軽減のため最大14日間しか保存されません。
+　必要に応じて、サイドバーの「…」→「会話を保存」からCSVをダウンロードしてください。
+"""
+
+def ensure_notice_file() -> None:
+    if os.path.exists(NOTICE_PATH):
+        return
+    try:
+        with open(NOTICE_PATH, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_NOTICE_TEXT)
+    except Exception:
+        pass
 
 
 def user_dir(user_id: str) -> str:
@@ -142,6 +164,67 @@ def resolve_api_key(model_key: str) -> str:
     return (os.environ.get(env_key) or "").strip() or DEFAULT_DIFY_API_KEY
 
 
+# -------- history prune (keep 14 days) --------
+def _last_prune_path(user_id: str) -> str:
+    return os.path.join(user_dir(user_id), ".last_prune.txt")
+
+def _read_last_prune(user_id: str) -> str:
+    p = _last_prune_path(user_id)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return (f.read() or "").strip()
+    except Exception:
+        return ""
+
+def _write_last_prune(user_id: str, ymd: str) -> None:
+    p = _last_prune_path(user_id)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(ymd)
+    except Exception:
+        pass
+
+def prune_history_14days(user_id: str) -> None:
+    ensure_all_csv(user_id)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _read_last_prune(user_id) == today:
+        return
+
+    cutoff = datetime.now() - timedelta(days=14)
+
+    kept: List[Dict[str, str]] = []
+    with open(history_csv_path(user_id), newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            ts = (row.get("timestamp") or "").strip()
+            try:
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                kept.append({
+                    "timestamp": row.get("timestamp") or "",
+                    "role": row.get("role") or "",
+                    "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
+                    "thread_id": row.get("thread_id") or "",
+                    "dify_conversation_id": row.get("dify_conversation_id") or "",
+                    "content": row.get("content") or "",
+                })
+                continue
+
+            if dt >= cutoff:
+                kept.append({
+                    "timestamp": row.get("timestamp") or "",
+                    "role": row.get("role") or "",
+                    "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
+                    "thread_id": row.get("thread_id") or "",
+                    "dify_conversation_id": row.get("dify_conversation_id") or "",
+                    "content": row.get("content") or "",
+                })
+
+    atomic_write_csv(history_csv_path(user_id), HISTORY_FIELDS, kept)
+    _write_last_prune(user_id, today)
+
+
 # -------- history --------
 def append_history(user_id: str, role: str, model_key: str, thread_id: str, dify_cid: str, content: str) -> str:
     ensure_all_csv(user_id)
@@ -149,6 +232,8 @@ def append_history(user_id: str, role: str, model_key: str, thread_id: str, dify
     with open(history_csv_path(user_id), "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([ts, role, model_key, thread_id, dify_cid or "", content])
+
+    prune_history_14days(user_id)
     return ts
 
 def read_history(user_id: str, thread_id: Optional[str], limit: int = 200) -> List[Dict[str, str]]:
@@ -172,15 +257,24 @@ def read_history(user_id: str, thread_id: Optional[str], limit: int = 200) -> Li
         rows = rows[-limit:]
     return rows
 
-def first_user_preview(user_id: str, thread_id: str, n: int = 20) -> str:
+def read_history_all(user_id: str, thread_id: Optional[str]) -> List[Dict[str, str]]:
+    if not thread_id:
+        return []
+    ensure_all_csv(user_id)
+    rows: List[Dict[str, str]] = []
     with open(history_csv_path(user_id), newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
             if (row.get("thread_id") or "").strip() != thread_id:
                 continue
-            if (row.get("role") or "").strip() == "user":
-                return (row.get("content") or "").strip()[:n]
-    return ""
+            rows.append({
+                "timestamp": row.get("timestamp") or "",
+                "role": row.get("role") or "",
+                "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
+                "thread_id": thread_id,
+                "content": row.get("content") or "",
+            })
+    return rows
 
 
 # -------- threads --------
@@ -236,7 +330,6 @@ def rename_thread(user_id: str, thread_id: str, name: str) -> bool:
     for r in rows:
         if r["thread_id"] == thread_id:
             r["name"] = name
-            # ★要望：プレビューも名前に合わせて更新
             r["preview"] = name[:20]
             r["updated_at"] = datetime.now().isoformat(timespec="seconds")
             _save_threads(user_id, rows)
@@ -252,7 +345,6 @@ def delete_thread(user_id: str, thread_id: str) -> bool:
         return False
     _save_threads(user_id, new_rows)
 
-    # history削除
     kept: List[Dict[str, str]] = []
     with open(history_csv_path(user_id), newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
@@ -269,7 +361,6 @@ def delete_thread(user_id: str, thread_id: str) -> bool:
             })
     atomic_write_csv(history_csv_path(user_id), HISTORY_FIELDS, kept)
 
-    # map削除
     kept2: List[Dict[str, str]] = []
     with open(map_csv_path(user_id), newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
@@ -351,9 +442,9 @@ def iter_dify_sse(resp: requests.Response) -> Iterable[Dict[str, Any]]:
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 os.makedirs(USERS_DIR, exist_ok=True)
+ensure_notice_file()
 
 def login_required(fn):
-    """画面系：未ログインなら /login に redirect"""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if not session.get("user_id"):
@@ -365,7 +456,6 @@ def login_required(fn):
     return wrapper
 
 def api_login_required(fn):
-    """API系：未ログインなら JSON 401（redirectしない）"""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         uid = session.get("user_id")
@@ -472,6 +562,46 @@ def api_history():
     } for r in rows]
     return jsonify({"items": items})
 
+@app.get("/api/export")
+@api_login_required
+def api_export_csv():
+    u = load_user(session["user_id"])
+    if not u:
+        session.clear()
+        return jsonify({"error": "user not found"}), 401
+
+    tid = (request.args.get("thread_id") or "").strip()
+    if not tid:
+        return jsonify({"error": "thread_id is required"}), 400
+
+    threads = _load_threads(u["user_id"])
+    if not any(t["thread_id"] == tid for t in threads):
+        return jsonify({"error": "thread not found"}), 404
+
+    items = read_history_all(u["user_id"], tid)
+
+    sio = io.StringIO()
+    w = csv.writer(sio, lineterminator="\n")
+    w.writerow(["timestamp", "role", "model_key", "thread_id", "content"])
+    for m in items:
+        w.writerow([
+            m.get("timestamp", ""),
+            m.get("role", ""),
+            m.get("model_key", ""),
+            m.get("thread_id", ""),
+            m.get("content", ""),
+        ])
+
+    csv_text = "\ufeff" + sio.getvalue()
+    return Response(
+        csv_text,
+        mimetype="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="chat.csv"',
+            "Cache-Control": "no-store",
+        },
+    )
+
 @app.get("/api/threads")
 @api_login_required
 def api_threads():
@@ -486,7 +616,6 @@ def api_threads():
     limit = max(1, min(limit, 200))
     return jsonify({"items": list_threads(u["user_id"], limit=limit)})
 
-# 互換：旧JSが /api/conversations を呼んでも動く
 @app.get("/api/conversations")
 @api_login_required
 def api_conversations_compat():
@@ -523,6 +652,24 @@ def api_thread_delete():
         return jsonify({"error": "not found"}), 404
     return jsonify({"ok": True})
 
+@app.get("/api/notice")
+@api_login_required
+def api_notice():
+    """
+    起動時ポップアップ用。BASE_DIR/notice.txt を読む（外部編集OK）
+    version は mtime で返す（内容変更すると自動で再表示できる）
+    """
+    ensure_notice_file()
+    try:
+        st = os.stat(NOTICE_PATH)
+        version = str(int(st.st_mtime))
+        with open(NOTICE_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        version = "0"
+        content = DEFAULT_NOTICE_TEXT
+    return jsonify({"version": version, "content": content})
+
 @app.post("/api/chat/stream")
 @api_login_required
 def api_chat_stream():
@@ -535,7 +682,7 @@ def api_chat_stream():
     api_key = resolve_api_key(model_key)
 
     if not DIFY_API_BASE:
-        return jsonify({"error": "DIFY_API_BASE not set (例: http://161.93.108.55:8890/v1)"}), 500
+        return jsonify({"error": "DIFY_API_BASE not set"}), 500
     if not api_key:
         return jsonify({"error": "API key not set"}), 500
 
@@ -549,10 +696,7 @@ def api_chat_stream():
 
     dify_cid_in = get_dify_cid(u["user_id"], thread_id, model_key)
 
-    # 1) user履歴を先に確定
     ts_user = append_history(u["user_id"], "user", model_key, thread_id, dify_cid_in, message)
-
-    # 2) 重要：Difyが失敗しても「スレッドとプレビュー(最初の質問)」は必ず残す
     upsert_thread(u["user_id"], thread_id, message[:20], ts_user)
 
     def generate():
@@ -597,10 +741,7 @@ def api_chat_stream():
                     elif ev_type == "message_end":
                         ts_bot = append_history(u["user_id"], "bot", model_key, thread_id, dify_cid, answer_acc)
                         set_dify_cid(u["user_id"], thread_id, model_key, dify_cid, ts_bot)
-
-                        # updated_at更新（previewは最初に埋めてるので上書きしない）
                         upsert_thread(u["user_id"], thread_id, "", ts_bot)
-
                         yield sse_pack("done", {"thread_id": thread_id, "answer": answer_acc, "model": model_key, "ts": ts_bot})
                         break
 
@@ -628,5 +769,4 @@ def ping():
     return "pong"
 
 if __name__ == "__main__":
-    # 保険：運用時はdebug=False推奨（リローダー由来の不安定さ回避）
     app.run(host="0.0.0.0", port=5200, debug=False, threaded=True)
