@@ -1,6 +1,6 @@
 (() => {
     // ----------------------------
-    // DOM guard: index.html only
+    // DOM guard: index.html only (core only)
     // ----------------------------
     const chat = document.getElementById("chat");
     const form = document.getElementById("form");
@@ -13,11 +13,7 @@
     const modelBtnText = document.getElementById("modelBtnText");
     const modelMenu = document.getElementById("modelMenu");
 
-    if (
-        !chat || !form || !input || !send ||
-        !newChatBtn || !convList || !toast ||
-        !modelBtn || !modelBtnText || !modelMenu
-    ) {
+    if (!chat || !form || !input || !send || !newChatBtn || !convList || !toast || !modelBtn || !modelBtnText || !modelMenu) {
         return;
     }
 
@@ -36,6 +32,7 @@
     };
 
     const modelLabel = (k) => (MODEL_INFO[k]?.label || k || "モデル");
+    const modelDesc = (k) => (MODEL_INFO[k]?.desc || "");
 
     function showToast(text) {
         toast.textContent = text;
@@ -53,7 +50,104 @@
         return iso;
     }
 
+    function nowStampForFile() {
+        const s = new Date().toISOString().slice(0, 19);
+        return s.replaceAll("-", "").replace("T", "_").replaceAll(":", "");
+    }
+
+    function sanitizeFilePart(s) {
+        return String(s || "")
+            .replace(/[\\\/:\*\?"<>\|]/g, "_")
+            .replace(/[\u0000-\u001f]/g, "")
+            .trim();
+    }
+
+    function threadDisplayName(it) {
+        return (it?.name || "").trim() || (it?.preview || "").trim() || "chat";
+    }
+
+    // ----------------------------
+    // Optional UI: model-status bar (auto create)
+    // ----------------------------
+    let currentModelPill = document.getElementById("currentModelPill");
+    let currentModelDescEl = document.getElementById("currentModelDesc");
+
+    function ensureModelStatusBar() {
+        if (currentModelPill && currentModelDescEl) return;
+
+        const composer = document.querySelector(".composer");
+        if (!composer) return;
+
+        const wrap = document.createElement("div");
+        wrap.className = "model-status";
+        wrap.innerHTML = `
+      <div class="model-status-left">現在のモデル</div>
+      <div class="model-status-right">
+        <span id="currentModelPill" class="model-pill">読み込み中…</span>
+        <span id="currentModelDesc" class="model-desc"></span>
+      </div>
+    `;
+        composer.parentNode.insertBefore(wrap, composer);
+
+        currentModelPill = document.getElementById("currentModelPill");
+        currentModelDescEl = document.getElementById("currentModelDesc");
+    }
+
+    function updateModelUI() {
+        modelBtnText.textContent = modelLabel(currentModel);
+        ensureModelStatusBar();
+        if (currentModelPill) currentModelPill.textContent = modelLabel(currentModel);
+        if (currentModelDescEl) currentModelDescEl.textContent = modelDesc(currentModel);
+    }
+
+    // ----------------------------
+    // Optional UI: notice modal (auto create)
+    // ----------------------------
+    let noticeModal = document.getElementById("noticeModal");
+    let noticeBody = document.getElementById("noticeBody");
+    let noticeOkBtn = document.getElementById("noticeOkBtn");
+
+    function ensureNoticeModal() {
+        if (noticeModal && noticeBody && noticeOkBtn) return;
+
+        const modal = document.createElement("div");
+        modal.id = "noticeModal";
+        modal.className = "modal";
+        modal.hidden = true;
+        modal.innerHTML = `
+      <div class="modal-backdrop"></div>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="noticeTitle">
+        <div class="modal-title" id="noticeTitle">更新履歴 / 注意事項</div>
+        <div id="noticeBody" class="modal-body"></div>
+        <div class="modal-actions">
+          <button id="noticeOkBtn" type="button" class="modal-ok">上記を了解した！</button>
+        </div>
+      </div>
+    `;
+        document.body.appendChild(modal);
+
+        noticeModal = document.getElementById("noticeModal");
+        noticeBody = document.getElementById("noticeBody");
+        noticeOkBtn = document.getElementById("noticeOkBtn");
+    }
+
+    function showNoticeModal(text) {
+        ensureNoticeModal();
+        if (!noticeModal || !noticeBody || !noticeOkBtn) return;
+        noticeBody.textContent = text || "";
+        noticeModal.hidden = false;
+        document.body.style.overflow = "hidden";
+    }
+
+    function hideNoticeModal() {
+        if (!noticeModal) return;
+        noticeModal.hidden = true;
+        document.body.style.overflow = "";
+    }
+
+    // ----------------------------
     // localStorage thread per user
+    // ----------------------------
     const activeThreadKey = () => `activeThread:${userId || "anon"}`;
     const setActiveThread = (tid) => {
         activeThreadId = (tid || "").trim() || null;
@@ -61,7 +155,6 @@
     };
     const loadActiveThread = () => (localStorage.getItem(activeThreadKey()) || "").trim() || null;
 
-    // ★追加：送信前に必ず thread_id を確定させる（meta/done取りこぼし保険）
     function newThreadId() {
         if (window.crypto?.randomUUID) return crypto.randomUUID().replaceAll("-", "");
         return (Date.now().toString(16) + Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)).slice(0, 32);
@@ -73,19 +166,37 @@
     async function apiFetch(url, opts) {
         const res = await fetch(url, opts);
 
-        // APIは401で返す設計（app.py側）
         if (res.status === 401) {
             location.href = "/login";
             throw new Error("unauthorized");
         }
 
-        // 念のためHTMLが返ってきたらログインへ
         const ct = (res.headers.get("content-type") || "").toLowerCase();
         if (ct.includes("text/html")) {
             location.href = "/login";
             throw new Error("not json");
         }
         return res;
+    }
+
+    // ----------------------------
+    // Notice fetch (毎回表示)
+    // ----------------------------
+    async function showNoticeEveryTime() {
+        // /api/notice が無い場合でもチャットを止めない
+        try {
+            const res = await apiFetch("/api/notice");
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) return;
+
+            const content = String(data.content || "");
+            showNoticeModal(content);
+
+            ensureNoticeModal();
+            noticeOkBtn.onclick = () => hideNoticeModal();
+        } catch {
+            // ignore
+        }
     }
 
     // ----------------------------
@@ -164,7 +275,7 @@
         chat.innerHTML = "";
         addMsg({
             role: "bot",
-            text: "ぼくはChuっとGPTです💋学習データの中からなら何でも回答します。左のモデルの中から最適なモデルを選択して質問してくださいね！",
+            text: "ぼくはChuっとGPTです💋 学習データの中から回答します。質問前に「現在のモデル」を確認してね！",
             modelKey: currentModel,
             timeISO: "",
             showModelTag: true,
@@ -184,7 +295,7 @@
         currentModel = data.current;
 
         buildModelMenu((data.models || []).map(x => x.key));
-        modelBtnText.textContent = modelLabel(currentModel);
+        updateModelUI();
         showToast(`現在：${modelLabel(currentModel)}`);
     }
 
@@ -198,10 +309,9 @@
         if (!res.ok) throw new Error(data.error || "model set error");
 
         currentModel = next;
-        modelBtnText.textContent = modelLabel(currentModel);
+        updateModelUI();
         showToast(`現在：${modelLabel(currentModel)}`);
 
-        // threadは維持（同一チャット継続）
         await loadThreads();
         await loadHistory();
     }
@@ -236,17 +346,56 @@
                 modelKey: m.model_key,
                 timeISO: m.created_at,
                 showModelTag: role === "bot",
-                showTime: role === "bot", // 要件：回答のみ右下に時刻
+                showTime: role === "bot",
             });
         }
 
-        if (items.length === 0) {
-            renderEmptyChat();
-        }
+        if (items.length === 0) renderEmptyChat();
     }
 
     // ----------------------------
-    // sidebar list
+    // flash highlight for export
+    // ----------------------------
+    function flashThread(threadId) {
+        const el = convList.querySelector(`.conv-item[data-thread-id="${CSS.escape(threadId)}"]`);
+        if (!el) return;
+        el.classList.add("flash");
+        clearTimeout(el._flashT);
+        el._flashT = setTimeout(() => el.classList.remove("flash"), 650);
+    }
+
+    // ----------------------------
+    // CSV export (thread)
+    // ----------------------------
+    async function exportThreadCsv(threadId, threadName) {
+        flashThread(threadId);
+
+        const url = new URL("/api/export", location.origin);
+        url.searchParams.set("thread_id", threadId);
+
+        const res = await apiFetch(url.toString());
+        if (!res.ok) {
+            const t = await res.text();
+            throw new Error(t);
+        }
+
+        const blob = await res.blob();
+        const a = document.createElement("a");
+        const objUrl = URL.createObjectURL(blob);
+
+        const safeTitle = sanitizeFilePart(threadName).slice(0, 60) || "chat";
+        const fname = `ChuっとGPT_${userId}_${safeTitle}_${nowStampForFile()}.csv`;
+
+        a.download = fname;
+        a.href = objUrl;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(objUrl), 1500);
+    }
+
+    // ----------------------------
+    // sidebar list & menu
     // ----------------------------
     function closeAnyMenu() {
         const m = document.querySelector(".menu-pop");
@@ -258,6 +407,10 @@
         const pop = document.createElement("div");
         pop.className = "menu-pop";
 
+        const btnExport = document.createElement("button");
+        btnExport.type = "button";
+        btnExport.textContent = "会話を保存";
+
         const btnRename = document.createElement("button");
         btnRename.type = "button";
         btnRename.textContent = "名前を変更する";
@@ -266,6 +419,16 @@
         btnDelete.type = "button";
         btnDelete.textContent = "削除する";
         btnDelete.className = "danger";
+
+        btnExport.addEventListener("click", async () => {
+            closeAnyMenu();
+            try {
+                await exportThreadCsv(it.thread_id, threadDisplayName(it));
+                showToast("CSVを保存しました");
+            } catch {
+                showToast("保存に失敗しました");
+            }
+        });
 
         btnRename.addEventListener("click", async () => {
             closeAnyMenu();
@@ -296,6 +459,7 @@
             await loadHistory();
         });
 
+        pop.appendChild(btnExport);
         pop.appendChild(btnRename);
         pop.appendChild(btnDelete);
         document.body.appendChild(pop);
@@ -326,6 +490,7 @@
         for (const it of items) {
             const row = document.createElement("div");
             row.className = "conv-item";
+            row.dataset.threadId = it.thread_id;
             if (activeThreadId && it.thread_id === activeThreadId) row.classList.add("active");
 
             const left = document.createElement("div");
@@ -345,7 +510,7 @@
             const more = document.createElement("button");
             more.className = "conv-more";
             more.type = "button";
-            more.textContent = "・・・";
+            more.textContent = "…";
 
             left.addEventListener("click", async () => {
                 setActiveThread(it.thread_id);
@@ -365,9 +530,8 @@
     }
 
     // ----------------------------
-    // New Chat: hard reset
+    // New Chat
     // ----------------------------
-    // ★安定化：新しいチャット押下時点で thread_id を作って確定
     newChatBtn.addEventListener("click", async () => {
         setActiveThread(newThreadId());
         renderEmptyChat();
@@ -405,15 +569,10 @@
     }
 
     async function streamChat(message) {
-        // ★最重要：送信前に thread_id を必ず確定（meta/done取りこぼしでも崩れない）
-        if (!activeThreadId) {
-            setActiveThread(newThreadId());
-        }
+        if (!activeThreadId) setActiveThread(newThreadId());
 
-        // まずユーザ発言を表示
         addMsg({ role: "user", text: message, modelKey: "", timeISO: "", showModelTag: false, showTime: false });
 
-        // “考え中”を先に出す（ここを書き換えていく）
         const { body: botBody, bubble: botBubble } = addMsg({
             role: "bot",
             text: "ちゅっと考え中・・・",
@@ -456,7 +615,6 @@
 
                 const { eventName, ev } = parsed;
 
-                // metaが来たら thread_id を上書きして同期（サーバ採番でも整合）
                 if (eventName === "meta") {
                     if (ev.thread_id) setActiveThread(ev.thread_id);
                     continue;
@@ -488,7 +646,6 @@
             }
         }
 
-        // streamがdone無しで閉じた時の保険：リセットせず復元を試みる
         if (!gotDone) {
             await loadThreads();
             if (activeThreadId) {
@@ -532,6 +689,10 @@
     (async () => {
         try {
             await loadModels();
+
+            // ✅ index.html が読み込まれるたびに必ず表示
+            await showNoticeEveryTime();
+
             activeThreadId = loadActiveThread();
             await loadThreads();
             await loadHistory();
