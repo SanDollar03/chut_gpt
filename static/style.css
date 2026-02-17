@@ -527,7 +527,7 @@ select option {
     left: 0;
     width: max-content;
     min-width: 100%;
-    max-width: 640px;
+    max-width: 960px;
     background: rgba(10, 14, 26, .98);
     border: 1px solid rgba(255, 255, 255, .14);
     border-radius: 14px;
