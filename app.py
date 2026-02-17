@@ -31,6 +31,7 @@ DEFAULT_MODEL_KEY = "seisan"
 MODELS = {
     "seisan":   {"label": "生産モデル 1.04",               "api_key_env": "DIFY_API_KEY_SEISAN"},
     "hozen":    {"label": "保全モデル 1.04",               "api_key_env": "DIFY_API_KEY_HOZEN"},
+    "sefety":   {"label": "安全モデル 1.01",              "api_key_env": "DIFY_API_KEY_SEFETY"},
     "ems":      {"label": "環境/EMSモデル 1.02",           "api_key_env": "DIFY_API_KEY_EMS"},
     "genka":    {"label": "原価・経営モデル 1.01",         "api_key_env": "DIFY_API_KEY_GENKA"},
     "jinji":    {"label": "人事制度モデル 1.03",           "api_key_env": "DIFY_API_KEY_JINJI"},
