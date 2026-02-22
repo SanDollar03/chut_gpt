@@ -1,7 +1,4 @@
 (() => {
-    // ----------------------------
-    // DOM guard: index.html only
-    // ----------------------------
     const chat = document.getElementById("chat");
     const form = document.getElementById("form");
     const input = document.getElementById("input");
@@ -13,6 +10,10 @@
     const modelBtnText = document.getElementById("modelBtnText");
     const modelMenu = document.getElementById("modelMenu");
 
+    const menuToggle = document.getElementById("menuToggle");
+    const sidebarOverlay = document.getElementById("sidebarOverlay");
+    const sidebar = document.querySelector(".sidebar");
+
     if (!chat || !form || !input || !send || !newChatBtn || !convList || !toast || !modelBtn || !modelBtnText || !modelMenu) {
         return;
     }
@@ -21,26 +22,22 @@
     let currentModel = null;
     let activeThreadId = null;
 
-    // thinking GIF（static/thinking.gif を配置）
     const THINKING_GIF_SRC = "/static/thinking.gif";
 
     const MODEL_INFO = {
-        seisan: { label: "生産モデル 1.17", desc: "現場の知識を、最短で引き出す。/ 現場会議議事録 / 能率管理表 / 品質過去トラ / 停止時間データ / 日報データ / 不良品データ / 変化点データ" },
-        hozen: { label: "保全モデル 1.14", desc: "巧の知識をヒントに。 / 現場会議議事録 / TMSS予防保全・突発事後・調査解析" },
-        sefety: { label: "安全・健康モデル 1.12", desc: "トミ鍛安全内規 / 鋳鍛設備課内規" },
-        ems: { label: "環境/EMSモデル 1.13", desc: "環境EMS / 潤滑油使用量 / CN会議" },
-        genka: { label: "原価・経営モデル 1.13", desc: "伝発注意事項 / 特調運用マニュアル / 経営会議資料" },
+        seisan: { label: "生産モデル 1.07", desc: "現場の知識を、最短で引き出す。/ 現場会議議事録 / 能率管理表 / 品質過去トラ / 停止時間データ / 日報データ / 不良品データ / 変化点データ" },
+        hozen: { label: "保全モデル 1.04", desc: "巧の知識をヒントに。 / 現場会議議事録 / TMSS予防保全・突発事後・調査解析" },
+        sefety: { label: "安全・健康モデル 1.02", desc: "トミ鍛安全内規 / 鋳鍛設備課内規" },
+        ems: { label: "環境/EMSモデル 1.02", desc: "環境EMS / 潤滑油使用量" },
+        genka: { label: "原価・経営モデル 1.03", desc: "伝発注意事項 / 特調運用マニュアル / 特調運用マニュアル_BCP" },
         jinji: { label: "人事制度モデル 1.03", desc: "コロナ発生時の対応_第33版 / 60歳以降の再雇用制度 退職手続きマニュアル / 期間従業員運用マニュアル" },
-        iatf: { label: "IATFモデル 1.15", desc: "IATF文書 / 現場会議議事録 / 品質過去トラ / 歯車基礎テキスト / 各種IATF基礎知識" },
+        iatf: { label: "IATFモデル 1.04", desc: "IATF文書 / 現場会議議事録 / 品質過去トラ / 歯車基礎テキスト" },
         security: { label: "情報セキュリティーモデル 1.02", desc: "鋳鍛造部 端末管理・セキュリティー管理 ルール / '25_社給スマートフォン更新手順" },
     };
 
     const modelLabel = (k) => (MODEL_INFO[k]?.label || k || "モデル");
     const modelDesc = (k) => (MODEL_INFO[k]?.desc || "");
 
-    // ----------------------------
-    // Toast
-    // ----------------------------
     function showToast(text) {
         toast.textContent = text;
         toast.classList.add("show");
@@ -73,9 +70,32 @@
         return (it?.name || "").trim() || (it?.preview || "").trim() || "chat";
     }
 
-    // ----------------------------
-    // Scroll: keep bottom visible
-    // ----------------------------
+    function isAscii1ByteLike(ch) {
+        const cp = ch.codePointAt(0);
+        return cp <= 0x7f;
+    }
+
+    function truncateByUnits(str, maxUnits) {
+        const s = String(str || "");
+        let units = 0;
+        let out = "";
+        for (let i = 0; i < s.length; i++) {
+            const ch = s[i];
+            const u = isAscii1ByteLike(ch) ? 1 : 2;
+            if (units + u > maxUnits) {
+                return out + "…";
+            }
+            out += ch;
+            units += u;
+        }
+        return out;
+    }
+
+    function threadPreviewText(it) {
+        const raw = (it?.name || "").trim() || (it?.preview || "").trim() || "（プレビューなし）";
+        return truncateByUnits(raw, 28);
+    }
+
     let stickToBottom = true;
 
     function scrollToBottom(force = false) {
@@ -89,9 +109,6 @@
         stickToBottom = nearBottom;
     });
 
-    // ----------------------------
-    // Optional UI: model-status bar (auto create)
-    // ----------------------------
     let currentModelPill = document.getElementById("currentModelPill");
     let currentModelDescEl = document.getElementById("currentModelDesc");
 
@@ -123,9 +140,6 @@
         if (currentModelDescEl) currentModelDescEl.textContent = modelDesc(currentModel);
     }
 
-    // ----------------------------
-    // Optional UI: notice modal (auto create)
-    // ----------------------------
     let noticeModal = document.getElementById("noticeModal");
     let noticeBody = document.getElementById("noticeBody");
     let noticeOkBtn = document.getElementById("noticeOkBtn");
@@ -168,9 +182,6 @@
         document.body.style.overflow = "";
     }
 
-    // ----------------------------
-    // localStorage thread per user
-    // ----------------------------
     const activeThreadKey = () => `activeThread:${userId || "anon"}`;
     const setActiveThread = (tid) => {
         activeThreadId = (tid || "").trim() || null;
@@ -183,9 +194,6 @@
         return (Date.now().toString(16) + Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)).slice(0, 32);
     }
 
-    // ----------------------------
-    // API fetch (401 -> login)
-    // ----------------------------
     async function apiFetch(url, opts) {
         const res = await fetch(url, opts);
 
@@ -202,9 +210,6 @@
         return res;
     }
 
-    // ----------------------------
-    // Notice fetch (毎回表示)
-    // ----------------------------
     async function showNoticeEveryTime() {
         try {
             const res = await apiFetch("/api/notice");
@@ -217,15 +222,19 @@
             ensureNoticeModal();
             noticeOkBtn.onclick = () => hideNoticeModal();
         } catch {
-            // ignore
         }
     }
 
-    // ----------------------------
-    // dropdown
-    // ----------------------------
-    function closeModelMenu() { modelMenu.hidden = true; modelBtn.classList.remove("open"); }
-    function openModelMenu() { modelMenu.hidden = false; modelBtn.classList.add("open"); }
+    function closeModelMenu() {
+        modelMenu.hidden = true;
+        modelBtn.classList.remove("open");
+        modelBtn.setAttribute("aria-expanded", "false");
+    }
+    function openModelMenu() {
+        modelMenu.hidden = false;
+        modelBtn.classList.add("open");
+        modelBtn.setAttribute("aria-expanded", "true");
+    }
     function toggleModelMenu() { modelMenu.hidden ? openModelMenu() : closeModelMenu(); }
 
     modelBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleModelMenu(); });
@@ -258,9 +267,6 @@
         }
     }
 
-    // ----------------------------
-    // chat UI (normal messages)
-    // ----------------------------
     function addMsg({ role, text, modelKey, timeISO, showModelTag, showTime }) {
         const row = document.createElement("div");
         row.className = `msg ${role}`;
@@ -305,9 +311,6 @@
         });
     }
 
-    // ----------------------------
-    // data load
-    // ----------------------------
     async function loadModels() {
         const res = await apiFetch("/api/models");
         const data = await res.json();
@@ -376,9 +379,6 @@
         scrollToBottom(true);
     }
 
-    // ----------------------------
-    // flash highlight for export
-    // ----------------------------
     function flashThread(threadId) {
         const el = convList.querySelector(`.conv-item[data-thread-id="${CSS.escape(threadId)}"]`);
         if (!el) return;
@@ -387,9 +387,6 @@
         el._flashT = setTimeout(() => el.classList.remove("flash"), 650);
     }
 
-    // ----------------------------
-    // CSV export (thread)
-    // ----------------------------
     async function exportThreadCsv(threadId, threadName) {
         flashThread(threadId);
 
@@ -417,9 +414,6 @@
         setTimeout(() => URL.revokeObjectURL(objUrl), 1500);
     }
 
-    // ----------------------------
-    // sidebar list & menu
-    // ----------------------------
     function closeAnyMenu() {
         const m = document.querySelector(".menu-pop");
         if (m) m.remove();
@@ -480,6 +474,7 @@
             if (activeThreadId === it.thread_id) setActiveThread(null);
             await loadThreads();
             await loadHistory();
+            closeSidebarIfMobile();
         });
 
         pop.appendChild(btnExport);
@@ -521,7 +516,7 @@
 
             const preview = document.createElement("div");
             preview.className = "conv-preview";
-            preview.textContent = (it.name || "").trim() || (it.preview || "").trim() || "（プレビューなし）";
+            preview.textContent = threadPreviewText(it);
 
             const meta = document.createElement("div");
             meta.className = "conv-meta";
@@ -540,6 +535,7 @@
                 await loadHistory();
                 await loadThreads();
                 scrollToBottom(true);
+                closeSidebarIfMobile();
             });
 
             more.addEventListener("click", (e) => {
@@ -553,9 +549,6 @@
         }
     }
 
-    // ----------------------------
-    // New Chat
-    // ----------------------------
     newChatBtn.addEventListener("click", async () => {
         setActiveThread(newThreadId());
         renderEmptyChat();
@@ -563,18 +556,17 @@
         await loadThreads();
         input.focus();
         scrollToBottom(true);
+        closeSidebarIfMobile();
     });
 
-    // ----------------------------
-    // Composer placeholder: "ちゅっと考え中・・・"
-    // ----------------------------
-    const defaultPlaceholder = input.getAttribute("placeholder") || "メッセージを入力…";
+    const defaultPlaceholder = input.getAttribute("placeholder") || "メッセージを入力… (Shift+Enterで改行)";
 
     function lockComposerThinking() {
         send.disabled = true;
         input.disabled = true;
         input.value = "";
         input.setAttribute("placeholder", "ちゅっと考え中・・・");
+        resizeInputToContent();
     }
 
     function unlockComposer() {
@@ -582,11 +574,9 @@
         input.disabled = false;
         input.setAttribute("placeholder", defaultPlaceholder);
         input.focus();
+        resizeInputToContent();
     }
 
-    // ----------------------------
-    // SSE parsing
-    // ----------------------------
     function stringifyErrPayload(ev) {
         if (!ev) return "stream error";
         if (typeof ev.message === "string" && ev.message.trim()) return ev.message;
@@ -612,9 +602,6 @@
         return { eventName, ev };
     }
 
-    // ----------------------------
-    // Thinking row (GIF only, no bubble, no model tag)
-    // ----------------------------
     function addThinkingGifOnlyRow() {
         const row = document.createElement("div");
         row.className = "msg bot gif-only";
@@ -627,30 +614,22 @@
         row.appendChild(img);
         chat.appendChild(row);
 
-        // 追加直後もスクロール
         scrollToBottom(true);
         requestAnimationFrame(() => scrollToBottom(true));
         setTimeout(() => scrollToBottom(true), 0);
 
-        // ★ここが重要：画像の高さ確定後に必ずもう一度スクロール
         const forceScrollAfterLoad = () => {
             scrollToBottom(true);
             requestAnimationFrame(() => scrollToBottom(true));
             setTimeout(() => scrollToBottom(true), 0);
         };
 
-        // decode() が使えるブラウザは decode 完了後が最も確実
         if (img.decode) {
-            img.decode().then(forceScrollAfterLoad).catch(() => {
-                // decode失敗時はonloadにフォールバック
-            });
+            img.decode().then(forceScrollAfterLoad).catch(() => { });
         }
 
         img.addEventListener("load", forceScrollAfterLoad, { once: true });
-        img.addEventListener("error", () => {
-            // 画像が無い/壊れててもUIが止まらないように
-            forceScrollAfterLoad();
-        }, { once: true });
+        img.addEventListener("error", () => forceScrollAfterLoad(), { once: true });
 
         return row;
     }
@@ -659,10 +638,8 @@
         if (!activeThreadId) setActiveThread(newThreadId());
         stickToBottom = true;
 
-        // User msg
         addMsg({ role: "user", text: message, modelKey: "", timeISO: "", showModelTag: false, showTime: false });
 
-        // Thinking GIF only (NO bubble)
         const thinkingRow = addThinkingGifOnlyRow();
 
         const res = await apiFetch("/api/chat/stream", {
@@ -705,25 +682,16 @@
 
                 if (eventName === "delta") {
                     if (!cleared) {
-                        thinkingRow.remove(); // ★GIF行を消す
+                        thinkingRow.remove();
                         full = "";
                         cleared = true;
                     }
 
-                    // 返答の吹き出し（通常表示：モデルタグは付ける）
-                    // 初回delta時に作る
-                    if (cleared && full === "") {
-                        // ここではまだbubbleが無いので1回だけ作る
-                    }
-
                     full += (ev.text || "");
 
-                    // まだ返答bubbleを作ってないなら作成
-                    // すでに最後のbot bubbleがあるならそこを更新
                     let lastBotBubbleText = chat.querySelector(".msg.bot:last-child .bubble-text");
                     let lastBotMsg = chat.querySelector(".msg.bot:last-child");
 
-                    // lastがgif-onlyだったら（念のため）作り直し
                     if (!lastBotMsg || lastBotMsg.classList.contains("gif-only")) {
                         const created = addMsg({
                             role: "bot",
@@ -735,7 +703,6 @@
                         });
                         lastBotBubbleText = created.body;
                     } else {
-                        // 既存のbot bubble-textに追記反映
                         if (!lastBotBubbleText) {
                             const created = addMsg({
                                 role: "bot",
@@ -760,7 +727,6 @@
                     }
                     full = ev.text || "";
 
-                    // bot bubbleを必ず用意して置換
                     let lastBotBubbleText = chat.querySelector(".msg.bot:last-child .bubble-text");
                     let lastBotMsg = chat.querySelector(".msg.bot:last-child");
 
@@ -814,9 +780,35 @@
         }
     }
 
-    // ----------------------------
-    // submit
-    // ----------------------------
+    function getMaxInputPx() {
+        const cs = window.getComputedStyle(input);
+        const lineH = parseFloat(cs.lineHeight) || 20;
+        const padTop = parseFloat(cs.paddingTop) || 0;
+        const padBottom = parseFloat(cs.paddingBottom) || 0;
+        const borderTop = parseFloat(cs.borderTopWidth) || 0;
+        const borderBottom = parseFloat(cs.borderBottomWidth) || 0;
+        return (lineH * 5) + padTop + padBottom + borderTop + borderBottom;
+    }
+
+    function resizeInputToContent() {
+        input.style.height = "auto";
+        const maxPx = getMaxInputPx();
+        const next = Math.min(input.scrollHeight, maxPx);
+        input.style.height = `${next}px`;
+        input.style.overflowY = (input.scrollHeight > maxPx) ? "auto" : "hidden";
+    }
+
+    input.addEventListener("input", () => resizeInputToContent());
+
+    input.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter") return;
+        if (e.shiftKey) return;
+        e.preventDefault();
+        if (send.disabled) return;
+        if (typeof form.requestSubmit === "function") form.requestSubmit();
+        else form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+    });
+
     form.addEventListener("submit", async (e) => {
         e.preventDefault();
         const message = input.value.trim();
@@ -826,6 +818,8 @@
 
         try {
             await streamChat(message);
+            input.value = "";
+            resizeInputToContent();
         } catch (err) {
             addMsg({
                 role: "bot",
@@ -841,9 +835,33 @@
         }
     });
 
-    // ----------------------------
-    // init
-    // ----------------------------
+    function setSidebarOpen(open) {
+        document.body.classList.toggle("sidebar-open", !!open);
+        if (menuToggle) menuToggle.setAttribute("aria-expanded", open ? "true" : "false");
+        if (sidebarOverlay) sidebarOverlay.hidden = !open;
+    }
+
+    function isMobile() {
+        return window.matchMedia && window.matchMedia("(max-width: 768px)").matches;
+    }
+
+    function closeSidebarIfMobile() {
+        if (isMobile()) setSidebarOpen(false);
+    }
+
+    if (menuToggle && sidebar && sidebarOverlay) {
+        menuToggle.addEventListener("click", () => {
+            const open = !document.body.classList.contains("sidebar-open");
+            setSidebarOpen(open);
+        });
+
+        sidebarOverlay.addEventListener("click", () => setSidebarOpen(false));
+    }
+
+    window.addEventListener("resize", () => {
+        if (!isMobile()) setSidebarOpen(false);
+    });
+
     (async () => {
         try {
             await loadModels();
@@ -854,6 +872,7 @@
             await loadHistory();
             if (!activeThreadId) renderEmptyChat();
             input.focus();
+            resizeInputToContent();
             scrollToBottom(true);
         } catch (e) {
             chat.innerHTML = "";

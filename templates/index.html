@@ -13,15 +13,11 @@
 <body>
     <div class="layout">
         <aside class="sidebar">
-            <div class="brand">
-                <div class="brand-mark">💋</div>
-                <div class="brand-text">ChuっとGPT</div>
-            </div>
 
             <div class="block">
                 <div class="label">モデル</div>
                 <div id="modelDropdown" class="dropdown">
-                    <button id="modelBtn" type="button" class="dropdown-btn">
+                    <button id="modelBtn" type="button" class="dropdown-btn" aria-haspopup="true" aria-expanded="false">
                         <span id="modelBtnText">読み込み中…</span>
                         <span class="dropdown-arrow">▽</span>
                     </button>
@@ -48,13 +44,19 @@
 
         <div class="main">
             <header class="topbar">
-                <div class="topbar-title">ChuっとGPT💋 ver.2.0.0</div>
-                <div class="topbar-sub">Akira Takasugi</div>
+                <button id="menuToggle" class="menu-toggle" type="button" aria-label="メニューを開閉" aria-expanded="false">
+                    <span class="menu-toggle-bar"></span>
+                    <span class="menu-toggle-bar"></span>
+                    <span class="menu-toggle-bar"></span>
+                </button>
+
+                <div class="topbar-title-wrap">
+                    <img class="topbar-banner" src="/static/banner.png" alt="ChuっとGPT" />
+                </div>
             </header>
 
             <main id="chat" class="chat"></main>
 
-            <!-- ①：質問前に常に見える「現在のモデル」表示 -->
             <div class="model-status">
                 <div class="model-status-left">現在のモデル</div>
                 <div class="model-status-right">
@@ -64,7 +66,7 @@
             </div>
 
             <form id="form" class="composer">
-                <input id="input" type="text" placeholder="メッセージを入力…" autocomplete="off" />
+                <textarea id="input" placeholder="メッセージを入力… (Shift+Enterで改行)" autocomplete="off" rows="1"></textarea>
                 <button id="send" type="submit">送信</button>
             </form>
         </div>
@@ -72,7 +74,6 @@
 
     <div id="toast" class="toast"></div>
 
-    <!-- ②③ 起動時ポップアップ（外部テキスト notice.txt を表示） -->
     <div id="noticeModal" class="modal" hidden>
         <div class="modal-backdrop"></div>
         <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="noticeTitle">
@@ -83,6 +84,8 @@
             </div>
         </div>
     </div>
+
+    <div id="sidebarOverlay" class="sidebar-overlay" hidden></div>
 
     <script src="/static/app.js"></script>
 </body>
