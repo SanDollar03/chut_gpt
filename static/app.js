@@ -3,6 +3,7 @@
     const form = document.getElementById("form");
     const input = document.getElementById("input");
     const send = document.getElementById("send");
+    const cancelBtn = document.getElementById("cancel");
     const newChatBtn = document.getElementById("newChatBtn");
     const convList = document.getElementById("convList");
     const toast = document.getElementById("toast");
@@ -14,7 +15,7 @@
     const sidebarOverlay = document.getElementById("sidebarOverlay");
     const sidebar = document.querySelector(".sidebar");
 
-    if (!chat || !form || !input || !send || !newChatBtn || !convList || !toast || !modelBtn || !modelBtnText || !modelMenu) {
+    if (!chat || !form || !input || !send || !cancelBtn || !newChatBtn || !convList || !toast || !modelBtn || !modelBtnText || !modelMenu) {
         return;
     }
 
@@ -561,9 +562,12 @@
 
     const defaultPlaceholder = input.getAttribute("placeholder") || "メッセージを入力… (Shift+Enterで改行)";
 
+    let currentAbortController = null;
+
     function lockComposerThinking() {
         send.disabled = true;
         input.disabled = true;
+        cancelBtn.hidden = false;
         input.value = "";
         input.setAttribute("placeholder", "ちゅっと考え中・・・");
         resizeInputToContent();
@@ -572,10 +576,19 @@
     function unlockComposer() {
         send.disabled = false;
         input.disabled = false;
+        cancelBtn.hidden = true;
+        currentAbortController = null;
         input.setAttribute("placeholder", defaultPlaceholder);
         input.focus();
         resizeInputToContent();
     }
+
+    cancelBtn.addEventListener("click", () => {
+        if (currentAbortController) {
+            currentAbortController.abort();
+            showToast("取消しました");
+        }
+    });
 
     function stringifyErrPayload(ev) {
         if (!ev) return "stream error";
@@ -641,69 +654,63 @@
         addMsg({ role: "user", text: message, modelKey: "", timeISO: "", showModelTag: false, showTime: false });
 
         const thinkingRow = addThinkingGifOnlyRow();
+        let res = null;
 
-        const res = await apiFetch("/api/chat/stream", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message, thread_id: activeThreadId })
-        });
+        try {
+            currentAbortController = new AbortController();
 
-        if (!res.ok) {
-            const t = await res.text();
-            throw new Error(t);
-        }
+            res = await apiFetch("/api/chat/stream", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message, thread_id: activeThreadId }),
+                signal: currentAbortController.signal
+            });
 
-        let full = "";
-        let cleared = false;
-        let gotDone = false;
+            if (!res.ok) {
+                const t = await res.text();
+                throw new Error(t);
+            }
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buf = "";
+            let full = "";
+            let cleared = false;
+            let gotDone = false;
 
-        while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            let buf = "";
 
-            buf += decoder.decode(value, { stream: true });
-            const { blocks, rest } = splitSseBlocks(buf);
-            buf = rest;
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
 
-            for (const block of blocks) {
-                const parsed = parseSseBlock(block);
-                if (!parsed) continue;
+                buf += decoder.decode(value, { stream: true });
+                const { blocks, rest } = splitSseBlocks(buf);
+                buf = rest;
 
-                const { eventName, ev } = parsed;
+                for (const block of blocks) {
+                    const parsed = parseSseBlock(block);
+                    if (!parsed) continue;
 
-                if (eventName === "meta") {
-                    if (ev.thread_id) setActiveThread(ev.thread_id);
-                    continue;
-                }
+                    const { eventName, ev } = parsed;
 
-                if (eventName === "delta") {
-                    if (!cleared) {
-                        thinkingRow.remove();
-                        full = "";
-                        cleared = true;
+                    if (eventName === "meta") {
+                        if (ev.thread_id) setActiveThread(ev.thread_id);
+                        continue;
                     }
 
-                    full += (ev.text || "");
+                    if (eventName === "delta") {
+                        if (!cleared) {
+                            thinkingRow.remove();
+                            full = "";
+                            cleared = true;
+                        }
 
-                    let lastBotBubbleText = chat.querySelector(".msg.bot:last-child .bubble-text");
-                    let lastBotMsg = chat.querySelector(".msg.bot:last-child");
+                        full += (ev.text || "");
 
-                    if (!lastBotMsg || lastBotMsg.classList.contains("gif-only")) {
-                        const created = addMsg({
-                            role: "bot",
-                            text: full,
-                            modelKey: currentModel,
-                            timeISO: "",
-                            showModelTag: true,
-                            showTime: false
-                        });
-                        lastBotBubbleText = created.body;
-                    } else {
-                        if (!lastBotBubbleText) {
+                        let lastBotBubbleText = chat.querySelector(".msg.bot:last-child .bubble-text");
+                        let lastBotMsg = chat.querySelector(".msg.bot:last-child");
+
+                        if (!lastBotMsg || lastBotMsg.classList.contains("gif-only")) {
                             const created = addMsg({
                                 role: "bot",
                                 text: full,
@@ -714,69 +721,98 @@
                             });
                             lastBotBubbleText = created.body;
                         } else {
-                            lastBotBubbleText.textContent = full;
+                            if (!lastBotBubbleText) {
+                                const created = addMsg({
+                                    role: "bot",
+                                    text: full,
+                                    modelKey: currentModel,
+                                    timeISO: "",
+                                    showModelTag: true,
+                                    showTime: false
+                                });
+                                lastBotBubbleText = created.body;
+                            } else {
+                                lastBotBubbleText.textContent = full;
+                            }
                         }
+
+                        scrollToBottom();
+
+                    } else if (eventName === "replace") {
+                        if (!cleared) {
+                            thinkingRow.remove();
+                            cleared = true;
+                        }
+                        full = ev.text || "";
+
+                        let lastBotBubbleText = chat.querySelector(".msg.bot:last-child .bubble-text");
+                        let lastBotMsg = chat.querySelector(".msg.bot:last-child");
+
+                        if (!lastBotMsg || lastBotMsg.classList.contains("gif-only")) {
+                            const created = addMsg({
+                                role: "bot",
+                                text: full,
+                                modelKey: currentModel,
+                                timeISO: "",
+                                showModelTag: true,
+                                showTime: false
+                            });
+                            lastBotBubbleText = created.body;
+                        } else if (lastBotBubbleText) {
+                            lastBotBubbleText.textContent = full;
+                        } else {
+                            const created = addMsg({
+                                role: "bot",
+                                text: full,
+                                modelKey: currentModel,
+                                timeISO: "",
+                                showModelTag: true,
+                                showTime: false
+                            });
+                            lastBotBubbleText = created.body;
+                        }
+
+                        scrollToBottom();
+
+                    } else if (eventName === "done") {
+                        gotDone = true;
+                        if (ev.thread_id) setActiveThread(ev.thread_id);
+
+                        await loadThreads();
+                        await loadHistory();
+                        scrollToBottom(true);
+                        return;
+
+                    } else if (eventName === "error") {
+                        throw new Error(stringifyErrPayload(ev));
                     }
-
-                    scrollToBottom();
-
-                } else if (eventName === "replace") {
-                    if (!cleared) {
-                        thinkingRow.remove();
-                        cleared = true;
-                    }
-                    full = ev.text || "";
-
-                    let lastBotBubbleText = chat.querySelector(".msg.bot:last-child .bubble-text");
-                    let lastBotMsg = chat.querySelector(".msg.bot:last-child");
-
-                    if (!lastBotMsg || lastBotMsg.classList.contains("gif-only")) {
-                        const created = addMsg({
-                            role: "bot",
-                            text: full,
-                            modelKey: currentModel,
-                            timeISO: "",
-                            showModelTag: true,
-                            showTime: false
-                        });
-                        lastBotBubbleText = created.body;
-                    } else if (lastBotBubbleText) {
-                        lastBotBubbleText.textContent = full;
-                    } else {
-                        const created = addMsg({
-                            role: "bot",
-                            text: full,
-                            modelKey: currentModel,
-                            timeISO: "",
-                            showModelTag: true,
-                            showTime: false
-                        });
-                        lastBotBubbleText = created.body;
-                    }
-
-                    scrollToBottom();
-
-                } else if (eventName === "done") {
-                    gotDone = true;
-                    if (ev.thread_id) setActiveThread(ev.thread_id);
-
-                    await loadThreads();
-                    await loadHistory();
-                    scrollToBottom(true);
-                    return;
-
-                } else if (eventName === "error") {
-                    throw new Error(stringifyErrPayload(ev));
                 }
             }
-        }
 
-        if (!gotDone) {
-            await loadThreads();
-            if (activeThreadId) {
-                await loadHistory();
-                scrollToBottom(true);
+            if (!gotDone) {
+                await loadThreads();
+                if (activeThreadId) {
+                    await loadHistory();
+                    scrollToBottom(true);
+                }
             }
+        } catch (err) {
+            if (err && (err.name === "AbortError" || String(err).includes("AbortError"))) {
+                try { thinkingRow.remove(); } catch { }
+                return;
+            }
+
+            try { thinkingRow.remove(); } catch { }
+
+            addMsg({
+                role: "bot",
+                text: "エラー: " + (err?.message || String(err)),
+                modelKey: currentModel,
+                timeISO: new Date().toISOString().slice(0, 19),
+                showModelTag: true,
+                showTime: true
+            });
+            scrollToBottom(true);
         }
     }
 
@@ -820,16 +856,6 @@
             await streamChat(message);
             input.value = "";
             resizeInputToContent();
-        } catch (err) {
-            addMsg({
-                role: "bot",
-                text: "エラー: " + (err?.message || String(err)),
-                modelKey: currentModel,
-                timeISO: new Date().toISOString().slice(0, 19),
-                showModelTag: true,
-                showTime: true
-            });
-            scrollToBottom(true);
         } finally {
             unlockComposer();
         }
