@@ -6,7 +6,7 @@ import uuid
 import io
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Dict, Any, Iterable, Optional, List
+from typing import Dict, Any, Iterable, Optional, List, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -46,6 +46,11 @@ MAP_FIELDS = ["thread_id", "model_key", "dify_conversation_id", "updated_at"]
 
 NOTICE_PATH = os.path.join(BASE_DIR, "notice.txt")
 
+# ---- Feedback (RAG用) ----
+FEEDBACK_DIR = os.path.join(BASE_DIR, "rag_feedback_md")
+FEEDBACK_STATE_CSV = os.path.join(FEEDBACK_DIR, "feedback_state.csv")
+FEEDBACK_FIELDS = ["user_id", "model_key", "thread_id", "bot_ts", "kind", "saved_at", "question", "answer"]
+
 
 def ensure_notice_file() -> None:
     if os.path.exists(NOTICE_PATH):
@@ -55,6 +60,176 @@ def ensure_notice_file() -> None:
             f.write("")
     except Exception:
         pass
+
+
+def ensure_feedback_dir() -> None:
+    try:
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def ensure_feedback_state_csv() -> None:
+    ensure_feedback_dir()
+    if os.path.exists(FEEDBACK_STATE_CSV):
+        return
+    with open(FEEDBACK_STATE_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=FEEDBACK_FIELDS)
+        w.writeheader()
+
+
+def _safe_filename_part(s: str) -> str:
+    s = (s or "").strip() or "unknown"
+    return re.sub(r"[\\/:*?\"<>|]+", "_", s)
+
+
+def _yyyymm_from_iso(iso: str) -> str:
+    # 期待値: YYYY-MM-DDTHH:MM:SS
+    # 失敗したら現在月
+    try:
+        dt = datetime.fromisoformat((iso or "").strip())
+        return dt.strftime("%Y%m")
+    except Exception:
+        return datetime.now().strftime("%Y%m")
+
+
+def _feedback_md_path(model_key: str, kind: str, yyyymm: str) -> str:
+    mk = _safe_filename_part(model_key)
+    kd = "good" if kind == "good" else "bad"
+    ym = re.sub(r"\D", "", (yyyymm or ""))[:6] or datetime.now().strftime("%Y%m")
+    return os.path.join(FEEDBACK_DIR, f"{mk}_{kd}_{ym}.md")
+
+
+def _feedback_key(user_id: str, model_key: str, thread_id: str, bot_ts: str) -> str:
+    return f"{user_id}||{model_key}||{thread_id}||{bot_ts}"
+
+
+def _load_feedback_state() -> List[Dict[str, str]]:
+    ensure_feedback_state_csv()
+    out: List[Dict[str, str]] = []
+    with open(FEEDBACK_STATE_CSV, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            out.append({k: row.get(k, "") for k in FEEDBACK_FIELDS})
+    return out
+
+
+def _save_feedback_state(rows: List[Dict[str, str]]) -> None:
+    ensure_feedback_state_csv()
+    tmp = FEEDBACK_STATE_CSV + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=FEEDBACK_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in FEEDBACK_FIELDS})
+    os.replace(tmp, FEEDBACK_STATE_CSV)
+
+
+def upsert_feedback_state(
+    *,
+    user_id: str,
+    model_key: str,
+    thread_id: str,
+    bot_ts: str,
+    kind: str,      # "good" | "bad" | "none"
+    saved_at: str,
+    question: str,
+    answer: str,
+) -> None:
+    rows = _load_feedback_state()
+    key = _feedback_key(user_id, model_key, thread_id, bot_ts)
+
+    out: List[Dict[str, str]] = []
+    found = False
+    for r in rows:
+        rk = _feedback_key(r.get("user_id", ""), r.get("model_key", ""), r.get("thread_id", ""), r.get("bot_ts", ""))
+        if rk != key:
+            out.append(r)
+            continue
+
+        found = True
+        if kind == "none":
+            continue  # 取り消し＝削除
+
+        r2 = dict(r)
+        r2["kind"] = kind
+        r2["saved_at"] = saved_at
+        r2["question"] = question
+        r2["answer"] = answer
+        out.append(r2)
+
+    if (not found) and kind != "none":
+        out.append({
+            "user_id": user_id,
+            "model_key": model_key,
+            "thread_id": thread_id,
+            "bot_ts": bot_ts,
+            "kind": kind,
+            "saved_at": saved_at,
+            "question": question,
+            "answer": answer,
+        })
+
+    _save_feedback_state(out)
+
+
+def rebuild_feedback_md_for_model(model_key: str) -> None:
+    """
+    model_key の現在状態から、
+      {model}_good_yyyymm.md
+      {model}_bad_yyyymm.md
+    を月別に全て再生成（上書き）する。
+    """
+    ensure_feedback_dir()
+    rows = _load_feedback_state()
+    mk = model_key
+
+    # 対象モデルだけ抽出
+    items = [r for r in rows if r.get("model_key") == mk and r.get("kind") in ("good", "bad")]
+
+    # (kind, yyyymm) -> list
+    buckets: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    for r in items:
+        ym = _yyyymm_from_iso(r.get("saved_at", ""))
+        k = (r.get("kind", ""), ym)
+        buckets.setdefault(k, []).append(r)
+
+    def one_chunk(r: Dict[str, str]) -> str:
+        return (
+            "***\n"
+            f"- saved_at: {r.get('saved_at', '')}\n"
+            f"- user_id: {r.get('user_id', '')}\n"
+            f"- model: {r.get('model_key', '')}\n"
+            "## Q\n"
+            f"{(r.get('question') or '').rstrip()}\n\n"
+            "## A\n"
+            f"{(r.get('answer') or '').rstrip()}\n"
+        )
+
+    # まず、このモデルの既存 md を一旦クリアしたいので、
+    # rag_feedback_md 配下の該当パターンを削除（安全のため model prefix で限定）
+    mk_safe = _safe_filename_part(mk)
+    try:
+        for fn in os.listdir(FEEDBACK_DIR):
+            if fn.startswith(mk_safe + "_") and fn.endswith(".md"):
+                # mk_good_yyyymm.md / mk_bad_yyyymm.md 想定
+                p = os.path.join(FEEDBACK_DIR, fn)
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # バケットごとに再生成
+    for (kind, ym), lst in buckets.items():
+        lst.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
+        path = _feedback_md_path(mk, kind, ym)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            for r in lst:
+                f.write(one_chunk(r))
+        os.replace(tmp, path)
 
 
 def user_dir(user_id: str) -> str:
@@ -452,6 +627,8 @@ app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 os.makedirs(USERS_DIR, exist_ok=True)
 ensure_notice_file()
+ensure_feedback_dir()
+ensure_feedback_state_csv()
 
 
 def login_required(fn):
@@ -687,6 +864,56 @@ def api_notice():
     return jsonify({"version": version, "content": content})
 
 
+@app.post("/api/feedback")
+@api_login_required
+def api_feedback():
+    u = load_user(session["user_id"])
+    if not u:
+        session.clear()
+        return jsonify({"error": "user not found"}), 401
+
+    data = request.get_json(force=True)
+
+    kind = (data.get("kind") or "").strip().lower()  # good / bad / none
+    model_key = (data.get("model_key") or u["model_key"] or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY
+    thread_id = (data.get("thread_id") or "").strip()
+    bot_ts = (data.get("bot_ts") or "").strip()
+    question = (data.get("question") or "")
+    answer = (data.get("answer") or "")
+
+    if kind not in ("good", "bad", "none"):
+        return jsonify({"error": "invalid kind"}), 400
+    if not thread_id:
+        return jsonify({"error": "thread_id required"}), 400
+    if not bot_ts:
+        return jsonify({"error": "bot_ts required"}), 400
+    if model_key not in MODELS:
+        model_key = u["model_key"]
+
+    if kind != "none":
+        if not str(question).strip() or not str(answer).strip():
+            return jsonify({"error": "question/answer empty"}), 400
+
+    saved_at = datetime.now().isoformat(timespec="seconds")
+
+    try:
+        upsert_feedback_state(
+            user_id=u["user_id"],
+            model_key=model_key,
+            thread_id=thread_id,
+            bot_ts=bot_ts,
+            kind=kind,
+            saved_at=saved_at,
+            question=str(question),
+            answer=str(answer),
+        )
+        rebuild_feedback_md_for_model(model_key)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True, "kind": kind})
+
+
 @app.post("/api/chat/stream")
 @api_login_required
 def api_chat_stream():
@@ -788,4 +1015,4 @@ def ping():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5200, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5201, debug=False, threaded=True)
