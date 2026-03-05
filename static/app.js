@@ -83,9 +83,7 @@
         for (let i = 0; i < s.length; i++) {
             const ch = s[i];
             const u = isAscii1ByteLike(ch) ? 1 : 2;
-            if (units + u > maxUnits) {
-                return out + "…";
-            }
+            if (units + u > maxUnits) return out + "…";
             out += ch;
             units += u;
         }
@@ -100,9 +98,7 @@
     let stickToBottom = true;
 
     function scrollToBottom(force = false) {
-        if (force || stickToBottom) {
-            chat.scrollTop = chat.scrollHeight;
-        }
+        if (force || stickToBottom) chat.scrollTop = chat.scrollHeight;
     }
 
     chat.addEventListener("scroll", () => {
@@ -268,7 +264,87 @@
         }
     }
 
-    function addMsg({ role, text, modelKey, timeISO, showModelTag, showTime }) {
+    async function sendFeedback({ kind, modelKey, threadId, question, answer, botTs }) {
+        const res = await apiFetch("/api/feedback", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                kind, // "good" | "bad" | "none"
+                model_key: modelKey,
+                thread_id: threadId,
+                question,
+                answer,
+                bot_ts: botTs,
+            })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || "feedback error");
+        return data;
+    }
+
+    function attachFeedbackUI({ bubble, modelKey, threadId, question, answer, botTs }) {
+        const bar = document.createElement("div");
+        bar.className = "feedback-bar";
+
+        const up = document.createElement("button");
+        up.type = "button";
+        up.className = "feedback-btn";
+        up.textContent = "👍";
+
+        const down = document.createElement("button");
+        down.type = "button";
+        down.className = "feedback-btn";
+        down.textContent = "👎";
+
+        let state = "none"; // "good" | "bad" | "none"
+
+        const render = () => {
+            up.classList.toggle("picked", state === "good");
+            down.classList.toggle("picked", state === "bad");
+        };
+
+        const commit = async (next) => {
+            up.disabled = true;
+            down.disabled = true;
+            try {
+                await sendFeedback({
+                    kind: next,
+                    modelKey,
+                    threadId,
+                    question,
+                    answer,
+                    botTs
+                });
+                state = next;
+                render();
+                if (next === "good") showToast("👍 を記録しました");
+                else if (next === "bad") showToast("👎 を記録しました");
+                else showToast("評価を取り消しました");
+            } catch {
+                showToast("記録に失敗しました");
+            } finally {
+                up.disabled = false;
+                down.disabled = false;
+            }
+        };
+
+        up.addEventListener("click", async () => {
+            const next = (state === "good") ? "none" : "good";
+            await commit(next);
+        });
+
+        down.addEventListener("click", async () => {
+            const next = (state === "bad") ? "none" : "bad";
+            await commit(next);
+        });
+
+        render();
+        bar.appendChild(up);
+        bar.appendChild(down);
+        bubble.appendChild(bar);
+    }
+
+    function addMsg({ role, text, modelKey, timeISO, showModelTag, showTime, feedback }) {
         const row = document.createElement("div");
         row.className = `msg ${role}`;
 
@@ -294,6 +370,17 @@
             bubble.appendChild(ts);
         }
 
+        if (role === "bot" && feedback && feedback.threadId && feedback.question && feedback.answer && feedback.botTs) {
+            attachFeedbackUI({
+                bubble,
+                modelKey: feedback.modelKey || modelKey || currentModel,
+                threadId: feedback.threadId,
+                question: feedback.question,
+                answer: feedback.answer,
+                botTs: feedback.botTs
+            });
+        }
+
         row.appendChild(bubble);
         chat.appendChild(row);
         scrollToBottom(true);
@@ -309,6 +396,7 @@
             timeISO: "",
             showModelTag: true,
             showTime: false,
+            feedback: null
         });
     }
 
@@ -364,15 +452,41 @@
         const items = data.items || [];
         chat.innerHTML = "";
 
+        let lastUserText = "";
+
         for (const m of items) {
             const role = m.role === "user" ? "user" : "bot";
+            if (role === "user") {
+                lastUserText = m.content || "";
+                addMsg({
+                    role,
+                    text: m.content,
+                    modelKey: m.model_key,
+                    timeISO: m.created_at,
+                    showModelTag: false,
+                    showTime: false,
+                    feedback: null
+                });
+                continue;
+            }
+
+            const botText = m.content || "";
+            const qText = lastUserText || "";
+
             addMsg({
-                role,
-                text: m.content,
+                role: "bot",
+                text: botText,
                 modelKey: m.model_key,
                 timeISO: m.created_at,
-                showModelTag: role === "bot",
-                showTime: role === "bot",
+                showModelTag: true,
+                showTime: true,
+                feedback: {
+                    threadId: m.thread_id,
+                    modelKey: m.model_key,
+                    question: qText,
+                    answer: botText,
+                    botTs: m.created_at
+                }
             });
         }
 
@@ -651,7 +765,7 @@
         if (!activeThreadId) setActiveThread(newThreadId());
         stickToBottom = true;
 
-        addMsg({ role: "user", text: message, modelKey: "", timeISO: "", showModelTag: false, showTime: false });
+        addMsg({ role: "user", text: message, modelKey: "", timeISO: "", showModelTag: false, showTime: false, feedback: null });
 
         const thinkingRow = addThinkingGifOnlyRow();
         let res = null;
@@ -717,7 +831,8 @@
                                 modelKey: currentModel,
                                 timeISO: "",
                                 showModelTag: true,
-                                showTime: false
+                                showTime: false,
+                                feedback: null
                             });
                             lastBotBubbleText = created.body;
                         } else {
@@ -728,7 +843,8 @@
                                     modelKey: currentModel,
                                     timeISO: "",
                                     showModelTag: true,
-                                    showTime: false
+                                    showTime: false,
+                                    feedback: null
                                 });
                                 lastBotBubbleText = created.body;
                             } else {
@@ -755,7 +871,8 @@
                                 modelKey: currentModel,
                                 timeISO: "",
                                 showModelTag: true,
-                                showTime: false
+                                showTime: false,
+                                feedback: null
                             });
                             lastBotBubbleText = created.body;
                         } else if (lastBotBubbleText) {
@@ -767,7 +884,8 @@
                                 modelKey: currentModel,
                                 timeISO: "",
                                 showModelTag: true,
-                                showTime: false
+                                showTime: false,
+                                feedback: null
                             });
                             lastBotBubbleText = created.body;
                         }
@@ -810,7 +928,8 @@
                 modelKey: currentModel,
                 timeISO: new Date().toISOString().slice(0, 19),
                 showModelTag: true,
-                showTime: true
+                showTime: true,
+                feedback: null
             });
             scrollToBottom(true);
         }
@@ -908,7 +1027,8 @@
                 modelKey: currentModel,
                 timeISO: "",
                 showModelTag: true,
-                showTime: false
+                showTime: false,
+                feedback: null
             });
             scrollToBottom(true);
         }
