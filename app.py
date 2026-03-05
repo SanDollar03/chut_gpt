@@ -37,6 +37,7 @@ MODELS = {
     "jinji":    {"label": "人事制度モデル 1.03", "api_key_env": "DIFY_API_KEY_JINJI"},
     "iatf":     {"label": "IATFモデル 1.04", "api_key_env": "DIFY_API_KEY_IATF"},
     "security": {"label": "情報セキュリティーモデル 1.02", "api_key_env": "DIFY_API_KEY_SECURITY"},
+    "miyoshi_try": {"label": "三好工場トライモデル 1.00", "api_key_env": "DIFY_API_KEY_MIYOSHI_TRY"},
 }
 
 USER_FIELDS = ["user_id", "password", "model_key", "created_at"]
@@ -1015,4 +1016,4 @@ def ping():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5201, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5200, debug=False, threaded=True)
