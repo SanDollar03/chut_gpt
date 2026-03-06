@@ -389,10 +389,11 @@
         body.textContent = text;
         bubble.appendChild(body);
 
-        if (showTime && timeISO) {
-            const ts = document.createElement("div");
+        let ts = null;
+        if (showTime) {
+            ts = document.createElement("div");
             ts.className = "msg-time";
-            ts.textContent = fmtDateTime(timeISO);
+            ts.textContent = fmtDateTime(timeISO || "");
             bubble.appendChild(ts);
         }
 
@@ -411,7 +412,7 @@
         row.appendChild(bubble);
         chat.appendChild(row);
         scrollToBottom(true);
-        return { body, bubble, row };
+        return { body, bubble, row, tsEl: ts };
     }
 
     function renderEmptyChat() {
@@ -794,6 +795,56 @@
         return row;
     }
 
+    // --------- P1-4: done後にloadHistoryしないための状態 ---------
+    let streamingBot = null; // { row, bubble, body, tsEl, question, modelKey, threadId, answerAcc }
+
+    function ensureStreamingBotBubble(questionText, modelKey, threadId) {
+        if (streamingBot && streamingBot.body) return streamingBot;
+        const created = addMsg({
+            role: "bot",
+            text: "",
+            modelKey: modelKey || currentModel,
+            timeISO: "",
+            showModelTag: true,
+            showTime: false,
+            feedback: null
+        });
+        streamingBot = {
+            row: created.row,
+            bubble: created.bubble,
+            body: created.body,
+            tsEl: created.tsEl,
+            question: questionText || "",
+            modelKey: modelKey || currentModel,
+            threadId: threadId || activeThreadId,
+            answerAcc: ""
+        };
+        return streamingBot;
+    }
+
+    function finalizeStreamingBot({ botTs, answer, modelKey, threadId, question }) {
+        if (!streamingBot || !streamingBot.body) return;
+
+        streamingBot.body.textContent = answer || streamingBot.answerAcc || "";
+
+        const timeEl = document.createElement("div");
+        timeEl.className = "msg-time";
+        timeEl.textContent = fmtDateTime(botTs || "");
+        streamingBot.bubble.appendChild(timeEl);
+
+        attachFeedbackUI({
+            bubble: streamingBot.bubble,
+            modelKey: modelKey || streamingBot.modelKey || currentModel,
+            threadId: threadId || streamingBot.threadId || activeThreadId,
+            question: question || streamingBot.question || "",
+            answer: answer || streamingBot.answerAcc || "",
+            botTs: botTs || "",
+            initialKind: "none"
+        });
+
+        streamingBot = null;
+    }
+
     async function streamChat(message) {
         if (!activeThreadId) setActiveThread(newThreadId());
         stickToBottom = true;
@@ -818,7 +869,6 @@
                 throw new Error(t);
             }
 
-            let full = "";
             let cleared = false;
             let gotDone = false;
 
@@ -848,42 +898,13 @@
                     if (eventName === "delta") {
                         if (!cleared) {
                             thinkingRow.remove();
-                            full = "";
                             cleared = true;
+                            ensureStreamingBotBubble(message, currentModel, activeThreadId);
                         }
 
-                        full += (ev.text || "");
-
-                        let lastBotBubbleText = chat.querySelector(".msg.bot:last-child .bubble-text");
-                        let lastBotMsg = chat.querySelector(".msg.bot:last-child");
-
-                        if (!lastBotMsg || lastBotMsg.classList.contains("gif-only")) {
-                            const created = addMsg({
-                                role: "bot",
-                                text: full,
-                                modelKey: currentModel,
-                                timeISO: "",
-                                showModelTag: true,
-                                showTime: false,
-                                feedback: null
-                            });
-                            lastBotBubbleText = created.body;
-                        } else {
-                            if (!lastBotBubbleText) {
-                                const created = addMsg({
-                                    role: "bot",
-                                    text: full,
-                                    modelKey: currentModel,
-                                    timeISO: "",
-                                    showModelTag: true,
-                                    showTime: false,
-                                    feedback: null
-                                });
-                                lastBotBubbleText = created.body;
-                            } else {
-                                lastBotBubbleText.textContent = full;
-                            }
-                        }
+                        const delta = (ev.text || "");
+                        streamingBot.answerAcc += delta;
+                        streamingBot.body.textContent = streamingBot.answerAcc;
 
                         scrollToBottom();
 
@@ -891,37 +912,11 @@
                         if (!cleared) {
                             thinkingRow.remove();
                             cleared = true;
+                            ensureStreamingBotBubble(message, currentModel, activeThreadId);
                         }
-                        full = ev.text || "";
 
-                        let lastBotBubbleText = chat.querySelector(".msg.bot:last-child .bubble-text");
-                        let lastBotMsg = chat.querySelector(".msg.bot:last-child");
-
-                        if (!lastBotMsg || lastBotMsg.classList.contains("gif-only")) {
-                            const created = addMsg({
-                                role: "bot",
-                                text: full,
-                                modelKey: currentModel,
-                                timeISO: "",
-                                showModelTag: true,
-                                showTime: false,
-                                feedback: null
-                            });
-                            lastBotBubbleText = created.body;
-                        } else if (lastBotBubbleText) {
-                            lastBotBubbleText.textContent = full;
-                        } else {
-                            const created = addMsg({
-                                role: "bot",
-                                text: full,
-                                modelKey: currentModel,
-                                timeISO: "",
-                                showModelTag: true,
-                                showTime: false,
-                                feedback: null
-                            });
-                            lastBotBubbleText = created.body;
-                        }
+                        streamingBot.answerAcc = (ev.text || "");
+                        streamingBot.body.textContent = streamingBot.answerAcc;
 
                         scrollToBottom();
 
@@ -929,8 +924,17 @@
                         gotDone = true;
                         if (ev.thread_id) setActiveThread(ev.thread_id);
 
+                        // P1-4: ここでloadHistoryしない
+                        finalizeStreamingBot({
+                            botTs: ev.ts || "",
+                            answer: ev.answer || (streamingBot ? streamingBot.answerAcc : ""),
+                            modelKey: ev.model || currentModel,
+                            threadId: ev.thread_id || activeThreadId,
+                            question: message
+                        });
+
+                        // threadsだけ更新（一覧更新）
                         await loadThreads();
-                        await loadHistory();
                         scrollToBottom(true);
                         return;
 
@@ -942,18 +946,20 @@
 
             if (!gotDone) {
                 await loadThreads();
-                if (activeThreadId) {
-                    await loadHistory();
-                    scrollToBottom(true);
+                if (!cleared) {
+                    try { thinkingRow.remove(); } catch { }
                 }
+                streamingBot = null;
             }
         } catch (err) {
             if (err && (err.name === "AbortError" || String(err).includes("AbortError"))) {
                 try { thinkingRow.remove(); } catch { }
+                streamingBot = null;
                 return;
             }
 
             try { thinkingRow.remove(); } catch { }
+            streamingBot = null;
 
             addMsg({
                 role: "bot",
