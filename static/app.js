@@ -25,6 +25,14 @@
 
     const THINKING_GIF_SRC = "/static/thinking.gif";
 
+    // ---- Notice cache keys (P1-2) ----
+    const noticeSeenKey = () => `noticeSeenVersion:${userId || "anon"}`;
+    const noticeCachedKey = () => `noticeCached:${userId || "anon"}`;
+
+    // ---- Feedback state cache (P1-3) ----
+    // key: `${threadId}||${modelKey || ""}` -> Map(bot_ts => "good"/"bad")
+    const feedbackStateCache = new Map();
+
     const MODEL_INFO = {
         seisan: { label: "生産モデル 1.07", desc: "現場の知識を、最短で引き出す。/ 現場会議議事録 / 能率管理表 / 品質過去トラ / 停止時間データ / 日報データ / 不良品データ / 変化点データ" },
         hozen: { label: "保全モデル 1.04", desc: "巧の知識をヒントに。 / 現場会議議事録 / TMSS予防保全・突発事後・調査解析" },
@@ -208,18 +216,48 @@
         return res;
     }
 
-    async function showNoticeEveryTime() {
+    // ---------------- P1-2: notice取得の差分化 ----------------
+    // 仕様:
+    // - serverのnotice.version が localStorageの noticeSeenVersion と違う時だけ取得/表示
+    // - 一度OKしたversionは再表示しない
+    async function maybeShowNoticeIfUpdated() {
         try {
+            const seen = (localStorage.getItem(noticeSeenKey()) || "").trim();
+            const cached = (() => {
+                try {
+                    return JSON.parse(localStorage.getItem(noticeCachedKey()) || "null");
+                } catch {
+                    return null;
+                }
+            })();
+
+            // まずは軽く /api/notice を取得（現状サーバ側にversion-only endpointがないため）
+            // ※受入条件「更新時のみ再取得/再表示」を満たすため、version一致時は表示も内容更新も行わない
             const res = await apiFetch("/api/notice");
             const data = await res.json().catch(() => ({}));
             if (!res.ok) return;
 
+            const version = String(data.version || "").trim();
             const content = String(data.content || "");
-            showNoticeModal(content);
 
+            if (!version) return;
+
+            // 既に同versionをOK済みなら何もしない（再表示しない）
+            if (seen === version) return;
+
+            // contentをキャッシュ（ユーザ毎）
+            localStorage.setItem(noticeCachedKey(), JSON.stringify({ version, content }));
+
+            showNoticeModal(content);
             ensureNoticeModal();
-            noticeOkBtn.onclick = () => hideNoticeModal();
+            noticeOkBtn.onclick = () => {
+                localStorage.setItem(noticeSeenKey(), version);
+                hideNoticeModal();
+            };
+
         } catch {
+            // noticeは非クリティカルなので握りつぶす
+            return;
         }
     }
 
@@ -283,12 +321,41 @@
         return data;
     }
 
-    async function loadFeedbackStateMap({ threadId, modelKey }) {
-        if (!threadId) return new Map();
+    function feedbackCacheKey(threadId, modelKey) {
+        return `${String(threadId || "").trim()}||${String(modelKey || "").trim()}`;
+    }
+
+    function updateFeedbackCache({ threadId, modelKey, botTs, kind }) {
+        const tid = String(threadId || "").trim();
+        const mk = String(modelKey || "").trim();
+        const bt = String(botTs || "").trim();
+        const kd = String(kind || "").trim().toLowerCase();
+        if (!tid || !bt) return;
+
+        const k = feedbackCacheKey(tid, mk);
+        let m = feedbackStateCache.get(k);
+        if (!m) {
+            m = new Map();
+            feedbackStateCache.set(k, m);
+        }
+        if (kd === "good" || kd === "bad") m.set(bt, kd);
+        else m.delete(bt);
+    }
+
+    async function loadFeedbackStateMap({ threadId, modelKey, force = false }) {
+        const tid = String(threadId || "").trim();
+        const mk = String(modelKey || "").trim();
+        if (!tid) return new Map();
+
+        const k = feedbackCacheKey(tid, mk);
+        if (!force && feedbackStateCache.has(k)) {
+            return feedbackStateCache.get(k);
+        }
+
         try {
             const url = new URL("/api/feedback/state", location.origin);
-            url.searchParams.set("thread_id", threadId);
-            if (modelKey) url.searchParams.set("model_key", modelKey);
+            url.searchParams.set("thread_id", tid);
+            if (mk) url.searchParams.set("model_key", mk);
 
             const res = await apiFetch(url.toString());
             const data = await res.json().catch(() => ({}));
@@ -302,6 +369,8 @@
                 if (kd !== "good" && kd !== "bad") continue;
                 m.set(bt, kd);
             }
+
+            feedbackStateCache.set(k, m);
             return m;
         } catch {
             return new Map();
@@ -343,6 +412,10 @@
                 });
                 state = next;
                 render();
+
+                // P1-3: cacheにも即反映（スレッド切替時の再取得を抑制しつつ復元保証）
+                updateFeedbackCache({ threadId, modelKey, botTs, kind: next });
+
                 if (next === "good") showToast("👍 を記録しました");
                 else if (next === "bad") showToast("👎 を記録しました");
                 else showToast("評価を取り消しました");
@@ -454,6 +527,8 @@
         updateModelUI();
         showToast(`現在：${modelLabel(currentModel)}`);
 
+        // model変更時はスレッド毎のフィードバック復元がモデル依存なので、表示時に再取得できるようにする
+        // （キャッシュは threadId||modelKey で保持されるので無害だが、必要なら取り直せる）
         await loadThreads();
         await loadHistory();
     }
@@ -471,6 +546,7 @@
             return;
         }
 
+        // P1-3: “必要なthread_idのみ” 取得、かつキャッシュ利用
         const feedbackMap = await loadFeedbackStateMap({ threadId: activeThreadId, modelKey: currentModel });
 
         const url = new URL("/api/history", location.origin);
@@ -680,6 +756,7 @@
             more.textContent = "…";
 
             left.addEventListener("click", async () => {
+                // スレッド切替 = ここだけでfeedback/stateを取得する運用（P1-3）
                 setActiveThread(it.thread_id);
                 await loadHistory();
                 await loadThreads();
@@ -795,7 +872,7 @@
         return row;
     }
 
-    // --------- P1-4: done後にloadHistoryしないための状態 ---------
+    // --------- P1-1: SSE done後の差分更新（履歴の全再読込をやめる） ---------
     let streamingBot = null; // { row, bubble, body, tsEl, question, modelKey, threadId, answerAcc }
 
     function ensureStreamingBotBubble(questionText, modelKey, threadId) {
@@ -924,7 +1001,7 @@
                         gotDone = true;
                         if (ev.thread_id) setActiveThread(ev.thread_id);
 
-                        // P1-4: ここでloadHistoryしない
+                        // P1-1: ここでloadHistoryしない。doneのanswer/tsを使い最後のbotを確定
                         finalizeStreamingBot({
                             botTs: ev.ts || "",
                             answer: ev.answer || (streamingBot ? streamingBot.answerAcc : ""),
@@ -933,8 +1010,9 @@
                             question: message
                         });
 
-                        // threadsだけ更新（一覧更新）
+                        // 一覧のみ更新（プレビュー・updated_atが反映される）
                         await loadThreads();
+
                         scrollToBottom(true);
                         return;
 
@@ -1049,7 +1127,9 @@
     (async () => {
         try {
             await loadModels();
-            await showNoticeEveryTime();
+
+            // P1-2: noticeは“更新された時だけ”表示
+            await maybeShowNoticeIfUpdated();
 
             activeThreadId = loadActiveThread();
             await loadThreads();
