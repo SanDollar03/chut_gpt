@@ -4,6 +4,8 @@ import csv
 import json
 import uuid
 import io
+import time
+from threading import Lock
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Dict, Any, Iterable, Optional, List, Tuple
@@ -50,6 +52,21 @@ NOTICE_PATH = os.path.join(BASE_DIR, "notice.txt")
 FEEDBACK_DIR = r"\\172.27.23.54\disk1\Chuppy\good_and_bad"
 FEEDBACK_STATE_CSV = os.path.join(FEEDBACK_DIR, "feedback_state.csv")
 FEEDBACK_FIELDS = ["user_id", "model_key", "thread_id", "bot_ts", "kind", "saved_at", "question", "answer"]
+
+# ---- Feedback md再生成の抑制（評価クリック高速化）----
+# 同一モデルのmd再生成を一定間隔に間引きます。
+REBUILD_COOLDOWN_SEC = 10  # 5〜30秒で調整。まずは10秒推奨。
+_rebuild_lock = Lock()
+_last_rebuild_at: Dict[str, float] = {}
+_dirty_models: Dict[str, bool] = {}
+
+
+def should_rebuild_now(model_key: str) -> bool:
+    now = time.time()
+    last = _last_rebuild_at.get(model_key, 0.0)
+    if not _dirty_models.get(model_key, False):
+        return False
+    return (now - last) >= REBUILD_COOLDOWN_SEC
 
 
 def ensure_notice_file() -> None:
@@ -913,7 +930,7 @@ def api_feedback():
 
     data = request.get_json(force=True)
 
-    kind = (data.get("kind") or "").strip().lower()
+    kind = (data.get("kind") or "").strip().lower()  # good / bad / none
     model_key = (data.get("model_key") or u["model_key"] or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY
     thread_id = (data.get("thread_id") or "").strip()
     bot_ts = (data.get("bot_ts") or "").strip()
@@ -946,7 +963,15 @@ def api_feedback():
             question=str(question),
             answer=str(answer),
         )
-        rebuild_feedback_md_for_model(model_key)
+
+        # md再生成は重い（NAS I/O）ため、一定間隔で間引く
+        with _rebuild_lock:
+            _dirty_models[model_key] = True
+            if should_rebuild_now(model_key):
+                rebuild_feedback_md_for_model(model_key)
+                _last_rebuild_at[model_key] = time.time()
+                _dirty_models[model_key] = False
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
