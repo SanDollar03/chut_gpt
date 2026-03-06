@@ -49,16 +49,26 @@ MAP_FIELDS = ["thread_id", "model_key", "dify_conversation_id", "updated_at"]
 
 NOTICE_PATH = os.path.join(BASE_DIR, "notice.txt")
 
-FEEDBACK_DIR = r"\\172.27.23.54\disk1\Chuppy\good_and_bad"
-FEEDBACK_STATE_CSV = os.path.join(FEEDBACK_DIR, "feedback_state.csv")
+# ===== Feedback / NAS =====
+FEEDBACK_DIR_NAS = r"\\172.27.23.54\disk1\Chuppy\good_and_bad"
+
+# ローカル退避先（NAS障害時）
+FEEDBACK_DIR_LOCAL = os.path.join(BASE_DIR, "_spool", "good_and_bad")
+
+FEEDBACK_STATE_NAME = "feedback_state.csv"
 FEEDBACK_FIELDS = ["user_id", "model_key", "thread_id", "bot_ts", "kind", "saved_at", "question", "answer"]
 
-# ---- Feedback md再生成の抑制（評価クリック高速化）----
-# 同一モデルのmd再生成を一定間隔に間引きます。
-REBUILD_COOLDOWN_SEC = 10  # 5〜30秒で調整。まずは10秒推奨。
+# ---- md再生成の抑制（P0-2）----
+REBUILD_COOLDOWN_SEC = 10
 _rebuild_lock = Lock()
 _last_rebuild_at: Dict[str, float] = {}
 _dirty_models: Dict[str, bool] = {}
+
+# ---- NAS可用性キャッシュ（毎回のUNCチェックを避ける）----
+_path_lock = Lock()
+_nas_ok_cache: Optional[bool] = None
+_nas_ok_checked_at: float = 0.0
+NAS_CHECK_TTL_SEC = 5
 
 
 def should_rebuild_now(model_key: str) -> bool:
@@ -79,15 +89,48 @@ def ensure_notice_file() -> None:
         pass
 
 
-def ensure_feedback_dir() -> None:
-    os.makedirs(FEEDBACK_DIR, exist_ok=True)
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
-def ensure_feedback_state_csv() -> None:
-    ensure_feedback_dir()
-    if os.path.exists(FEEDBACK_STATE_CSV):
+def is_dir_writable(path: str) -> bool:
+    try:
+        ensure_dir(path)
+        probe = os.path.join(path, ".write_test.tmp")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def is_nas_available_cached() -> bool:
+    global _nas_ok_cache, _nas_ok_checked_at
+    now = time.time()
+    with _path_lock:
+        if _nas_ok_cache is not None and (now - _nas_ok_checked_at) < NAS_CHECK_TTL_SEC:
+            return _nas_ok_cache
+        ok = is_dir_writable(FEEDBACK_DIR_NAS)
+        _nas_ok_cache = ok
+        _nas_ok_checked_at = now
+        return ok
+
+
+def active_feedback_dir() -> str:
+    return FEEDBACK_DIR_NAS if is_nas_available_cached() else FEEDBACK_DIR_LOCAL
+
+
+def feedback_state_csv_path(dir_path: str) -> str:
+    return os.path.join(dir_path, FEEDBACK_STATE_NAME)
+
+
+def ensure_feedback_state_csv(dir_path: str) -> None:
+    ensure_dir(dir_path)
+    path = feedback_state_csv_path(dir_path)
+    if os.path.exists(path):
         return
-    with open(FEEDBACK_STATE_CSV, "w", newline="", encoding="utf-8") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FEEDBACK_FIELDS)
         w.writeheader()
 
@@ -105,40 +148,80 @@ def _yyyymm_from_iso(iso: str) -> str:
         return datetime.now().strftime("%Y%m")
 
 
-def _feedback_md_path(model_key: str, kind: str, yyyymm: str) -> str:
+def _feedback_md_path(dir_path: str, model_key: str, kind: str, yyyymm: str) -> str:
     mk = _safe_filename_part(model_key)
     kd = "good" if kind == "good" else "bad"
     ym = re.sub(r"\D", "", (yyyymm or ""))[:6] or datetime.now().strftime("%Y%m")
-    return os.path.join(FEEDBACK_DIR, f"{mk}_{kd}_{ym}.md")
+    return os.path.join(dir_path, f"{mk}_{kd}_{ym}.md")
 
 
 def _feedback_key(user_id: str, model_key: str, thread_id: str, bot_ts: str) -> str:
     return f"{user_id}||{model_key}||{thread_id}||{bot_ts}"
 
 
-def _load_feedback_state() -> List[Dict[str, str]]:
-    ensure_feedback_state_csv()
+def _load_feedback_state_from(dir_path: str) -> List[Dict[str, str]]:
+    ensure_feedback_state_csv(dir_path)
+    path = feedback_state_csv_path(dir_path)
     out: List[Dict[str, str]] = []
-    with open(FEEDBACK_STATE_CSV, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
             out.append({k: row.get(k, "") for k in FEEDBACK_FIELDS})
     return out
 
 
-def _save_feedback_state(rows: List[Dict[str, str]]) -> None:
-    ensure_feedback_state_csv()
-    tmp = FEEDBACK_STATE_CSV + ".tmp"
+def _save_feedback_state_to(dir_path: str, rows: List[Dict[str, str]]) -> None:
+    ensure_feedback_state_csv(dir_path)
+    path = feedback_state_csv_path(dir_path)
+    tmp = path + ".tmp"
     with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FEEDBACK_FIELDS)
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in FEEDBACK_FIELDS})
-    os.replace(tmp, FEEDBACK_STATE_CSV)
+    os.replace(tmp, path)
 
 
-def upsert_feedback_state(
+def _merge_feedback_rows(primary: List[Dict[str, str]], secondary: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    def ts_key(x: Dict[str, str]) -> str:
+        return (x.get("saved_at") or "").strip()
+
+    m: Dict[str, Dict[str, str]] = {}
+    for r in primary:
+        k = _feedback_key(r.get("user_id", ""), r.get("model_key", ""), r.get("thread_id", ""), r.get("bot_ts", ""))
+        m[k] = r
+    for r in secondary:
+        k = _feedback_key(r.get("user_id", ""), r.get("model_key", ""), r.get("thread_id", ""), r.get("bot_ts", ""))
+        if k not in m:
+            m[k] = r
+            continue
+        if ts_key(r) >= ts_key(m[k]):
+            m[k] = r
+    return list(m.values())
+
+
+def load_feedback_state_merged() -> List[Dict[str, str]]:
+    rows_nas: List[Dict[str, str]] = []
+    rows_local: List[Dict[str, str]] = []
+    try:
+        if os.path.exists(FEEDBACK_DIR_NAS) or is_nas_available_cached():
+            if os.path.exists(feedback_state_csv_path(FEEDBACK_DIR_NAS)):
+                rows_nas = _load_feedback_state_from(FEEDBACK_DIR_NAS)
+    except Exception:
+        rows_nas = []
+
+    try:
+        if os.path.exists(feedback_state_csv_path(FEEDBACK_DIR_LOCAL)):
+            rows_local = _load_feedback_state_from(FEEDBACK_DIR_LOCAL)
+    except Exception:
+        rows_local = []
+
+    return _merge_feedback_rows(rows_nas, rows_local)
+
+
+def upsert_feedback_state_to_dir(
     *,
+    dir_path: str,
     user_id: str,
     model_key: str,
     thread_id: str,
@@ -148,7 +231,7 @@ def upsert_feedback_state(
     question: str,
     answer: str,
 ) -> None:
-    rows = _load_feedback_state()
+    rows = _load_feedback_state_from(dir_path)
     key = _feedback_key(user_id, model_key, thread_id, bot_ts)
 
     out: List[Dict[str, str]] = []
@@ -182,12 +265,12 @@ def upsert_feedback_state(
             "answer": answer,
         })
 
-    _save_feedback_state(out)
+    _save_feedback_state_to(dir_path, out)
 
 
-def rebuild_feedback_md_for_model(model_key: str) -> None:
-    ensure_feedback_dir()
-    rows = _load_feedback_state()
+def rebuild_feedback_md_for_model_in_dir(dir_path: str, model_key: str) -> None:
+    ensure_dir(dir_path)
+    rows = _load_feedback_state_from(dir_path)
     mk = model_key
 
     items = [r for r in rows if r.get("model_key") == mk and r.get("kind") in ("good", "bad")]
@@ -212,9 +295,9 @@ def rebuild_feedback_md_for_model(model_key: str) -> None:
 
     mk_safe = _safe_filename_part(mk)
     try:
-        for fn in os.listdir(FEEDBACK_DIR):
+        for fn in os.listdir(dir_path):
             if fn.startswith(mk_safe + "_") and fn.endswith(".md"):
-                p = os.path.join(FEEDBACK_DIR, fn)
+                p = os.path.join(dir_path, fn)
                 try:
                     os.remove(p)
                 except Exception:
@@ -224,12 +307,59 @@ def rebuild_feedback_md_for_model(model_key: str) -> None:
 
     for (kind, ym), lst in buckets.items():
         lst.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
-        path = _feedback_md_path(mk, kind, ym)
+        path = _feedback_md_path(dir_path, mk, kind, ym)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             for r in lst:
                 f.write(one_chunk(r))
         os.replace(tmp, path)
+
+
+def sync_local_spool_to_nas_if_possible() -> None:
+    if not is_nas_available_cached():
+        return
+
+    local_csv = feedback_state_csv_path(FEEDBACK_DIR_LOCAL)
+    if not os.path.exists(local_csv):
+        return
+
+    try:
+        rows_local = _load_feedback_state_from(FEEDBACK_DIR_LOCAL)
+    except Exception:
+        return
+
+    if not rows_local:
+        return
+
+    try:
+        ensure_feedback_state_csv(FEEDBACK_DIR_NAS)
+        rows_nas = _load_feedback_state_from(FEEDBACK_DIR_NAS)
+        merged = _merge_feedback_rows(rows_nas, rows_local)
+        _save_feedback_state_to(FEEDBACK_DIR_NAS, merged)
+
+        mk_set = set()
+        for r in rows_local:
+            mk = (r.get("model_key") or "").strip()
+            if mk:
+                mk_set.add(mk)
+
+        for mk in mk_set:
+            try:
+                rebuild_feedback_md_for_model_in_dir(FEEDBACK_DIR_NAS, mk)
+            except Exception:
+                pass
+
+        bak = local_csv + f".bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        try:
+            os.replace(local_csv, bak)
+        except Exception:
+            try:
+                os.remove(local_csv)
+            except Exception:
+                pass
+
+    except Exception:
+        return
 
 
 def list_feedback_state_for_user_thread(
@@ -238,7 +368,7 @@ def list_feedback_state_for_user_thread(
     thread_id: str,
     model_key: Optional[str],
 ) -> List[Dict[str, str]]:
-    rows = _load_feedback_state()
+    rows = load_feedback_state_merged()
     out: List[Dict[str, str]] = []
     for r in rows:
         if (r.get("user_id") or "") != user_id:
@@ -655,8 +785,10 @@ app.secret_key = FLASK_SECRET_KEY
 
 os.makedirs(USERS_DIR, exist_ok=True)
 ensure_notice_file()
-ensure_feedback_dir()
-ensure_feedback_state_csv()
+ensure_dir(FEEDBACK_DIR_LOCAL)
+ensure_feedback_state_csv(FEEDBACK_DIR_LOCAL)
+if is_nas_available_cached():
+    ensure_feedback_state_csv(FEEDBACK_DIR_NAS)
 
 
 def login_required(fn):
@@ -930,7 +1062,7 @@ def api_feedback():
 
     data = request.get_json(force=True)
 
-    kind = (data.get("kind") or "").strip().lower()  # good / bad / none
+    kind = (data.get("kind") or "").strip().lower()
     model_key = (data.get("model_key") or u["model_key"] or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY
     thread_id = (data.get("thread_id") or "").strip()
     bot_ts = (data.get("bot_ts") or "").strip()
@@ -953,7 +1085,13 @@ def api_feedback():
     saved_at = datetime.now().isoformat(timespec="seconds")
 
     try:
-        upsert_feedback_state(
+        # NASが復旧していたら、まずローカル退避分をNASへ同期（軽量ではないが、評価タイミングが最も安全）
+        sync_local_spool_to_nas_if_possible()
+
+        # 書ける方へ保存（NAS優先、だめならローカル）
+        target_dir = active_feedback_dir()
+        upsert_feedback_state_to_dir(
+            dir_path=target_dir,
             user_id=u["user_id"],
             model_key=model_key,
             thread_id=thread_id,
@@ -964,18 +1102,18 @@ def api_feedback():
             answer=str(answer),
         )
 
-        # md再生成は重い（NAS I/O）ため、一定間隔で間引く
+        # md再生成（P0-2）：重いので一定間隔で間引く
         with _rebuild_lock:
             _dirty_models[model_key] = True
             if should_rebuild_now(model_key):
-                rebuild_feedback_md_for_model(model_key)
+                rebuild_feedback_md_for_model_in_dir(target_dir, model_key)
                 _last_rebuild_at[model_key] = time.time()
                 _dirty_models[model_key] = False
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    return jsonify({"ok": True, "kind": kind})
+    return jsonify({"ok": True, "kind": kind, "stored_to": "nas" if target_dir == FEEDBACK_DIR_NAS else "local"})
 
 
 @app.post("/api/chat/stream")
