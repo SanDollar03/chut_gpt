@@ -5,6 +5,7 @@ import json
 import uuid
 import io
 import time
+import shutil
 from threading import Lock
 from datetime import datetime, timedelta
 from functools import wraps
@@ -23,7 +24,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 USERS_DIR = os.path.join(BASE_DIR, "users")
 
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-me")
-
 DIFY_API_BASE = (os.environ.get("DIFY_API_BASE") or "http://161.93.108.55:8890/v1").rstrip("/")
 DEFAULT_DIFY_API_KEY = (os.environ.get("DIFY_API_KEY") or "").strip()
 
@@ -42,28 +42,60 @@ MODELS = {
     "miyoshi_try": {"label": "三好工場トライモデル 1.00", "api_key_env": "DIFY_API_KEY_MIYOSHI_TRY"},
 }
 
+NOTICE_PATH = os.path.join(BASE_DIR, "notice.txt")
+
 USER_FIELDS = ["user_id", "password", "model_key", "created_at"]
 HISTORY_FIELDS = ["timestamp", "role", "model_key", "thread_id", "dify_conversation_id", "content"]
 THREAD_FIELDS = ["thread_id", "name", "preview", "created_at", "updated_at"]
 MAP_FIELDS = ["thread_id", "model_key", "dify_conversation_id", "updated_at"]
 
-NOTICE_PATH = os.path.join(BASE_DIR, "notice.txt")
-
-FEEDBACK_DIR_NAS = r"\\172.27.23.54\disk1\Chuppy\good_and_bad"
+FEEDBACK_DIR_NAS = os.environ.get("FEEDBACK_DIR_NAS") or r"\\172.27.23.54\disk1\Chuppy\good_and_bad"
 FEEDBACK_DIR_LOCAL = os.path.join(BASE_DIR, "_spool", "good_and_bad")
-
 FEEDBACK_STATE_NAME = "feedback_state.csv"
 FEEDBACK_FIELDS = ["user_id", "model_key", "thread_id", "bot_ts", "kind", "saved_at", "question", "answer"]
+
+NAS_CHECK_TTL_SEC = 5
+_path_lock = Lock()
+_nas_ok_cache: Optional[bool] = None
+_nas_ok_checked_at: float = 0.0
 
 MD_REBUILD_COOLDOWN_SEC = 10
 _md_lock = Lock()
 _last_md_rebuild_at: Dict[str, float] = {}
 _dirty_months_by_model: Dict[str, Set[str]] = {}
 
-_path_lock = Lock()
-_nas_ok_cache: Optional[bool] = None
-_nas_ok_checked_at: float = 0.0
-NAS_CHECK_TTL_SEC = 5
+BACKUP_DIR = os.environ.get("BACKUP_DIR") or os.path.join(BASE_DIR, "_backup")
+BACKUP_KEEP_DAYS = int(os.environ.get("BACKUP_KEEP_DAYS") or "30")
+MAINTENANCE_TTL_SEC = int(os.environ.get("MAINTENANCE_TTL_SEC") or "300")
+_maintenance_lock = Lock()
+_last_maintenance_at: float = 0.0
+
+_file_locks: Dict[str, Lock] = {}
+_file_locks_guard = Lock()
+
+
+def _lock_for_path(path: str) -> Lock:
+    p = os.path.abspath(path)
+    with _file_locks_guard:
+        lk = _file_locks.get(p)
+        if lk is None:
+            lk = Lock()
+            _file_locks[p] = lk
+        return lk
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def ensure_notice_file() -> None:
+    if os.path.exists(NOTICE_PATH):
+        return
+    try:
+        with open(NOTICE_PATH, "w", encoding="utf-8") as f:
+            f.write("")
+    except Exception:
+        pass
 
 
 def _csv_cache() -> Dict[str, Any]:
@@ -80,44 +112,47 @@ def csv_read_dicts_cached(path: str, fieldnames: List[str]) -> List[Dict[str, st
     if key in cache:
         return cache[key]
 
-    if not os.path.exists(path):
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
+    lk = _lock_for_path(path)
+    with lk:
+        if not os.path.exists(path):
+            ensure_dir(os.path.dirname(path))
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
 
-    out: List[Dict[str, str]] = []
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            out.append({k: row.get(k, "") for k in fieldnames})
+        out: List[Dict[str, str]] = []
+        with open(path, newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                out.append({k: row.get(k, "") for k in fieldnames})
 
     cache[key] = out
     return out
 
 
 def csv_write_dicts_atomic(path: str, fieldnames: List[str], rows: List[Dict[str, str]]) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in fieldnames})
-    os.replace(tmp, path)
+    lk = _lock_for_path(path)
+    with lk:
+        ensure_dir(os.path.dirname(path))
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in fieldnames})
+        os.replace(tmp, path)
+
     _csv_cache().pop(f"read::{path}", None)
 
 
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def ensure_notice_file() -> None:
-    if os.path.exists(NOTICE_PATH):
-        return
-    try:
-        with open(NOTICE_PATH, "w", encoding="utf-8") as f:
-            f.write("")
-    except Exception:
-        pass
+def csv_append_row(path: str, row: List[str]) -> None:
+    lk = _lock_for_path(path)
+    with lk:
+        ensure_dir(os.path.dirname(path))
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(row)
+    _csv_cache().pop(f"read::{path}", None)
 
 
 def is_dir_writable(path: str) -> bool:
@@ -146,6 +181,339 @@ def is_nas_available_cached() -> bool:
 
 def active_feedback_dir() -> str:
     return FEEDBACK_DIR_NAS if is_nas_available_cached() else FEEDBACK_DIR_LOCAL
+
+
+def user_dir(user_id: str) -> str:
+    return os.path.join(USERS_DIR, user_id)
+
+
+def user_csv_path(user_id: str) -> str:
+    return os.path.join(user_dir(user_id), "user.csv")
+
+
+def history_csv_path(user_id: str) -> str:
+    return os.path.join(user_dir(user_id), "history.csv")
+
+
+def threads_csv_path(user_id: str) -> str:
+    return os.path.join(user_dir(user_id), "threads.csv")
+
+
+def map_csv_path(user_id: str) -> str:
+    return os.path.join(user_dir(user_id), "thread_map.csv")
+
+
+def ensure_csv(path: str, fieldnames: List[str]) -> None:
+    if os.path.exists(path):
+        return
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+
+
+def ensure_all_user_csv(user_id: str) -> None:
+    ensure_dir(user_dir(user_id))
+    ensure_csv(history_csv_path(user_id), HISTORY_FIELDS)
+    ensure_csv(threads_csv_path(user_id), THREAD_FIELDS)
+    ensure_csv(map_csv_path(user_id), MAP_FIELDS)
+
+
+def user_exists(user_id: str) -> bool:
+    return os.path.exists(user_csv_path(user_id))
+
+
+def load_user(user_id: str) -> Optional[Dict[str, str]]:
+    p = user_csv_path(user_id)
+    if not os.path.exists(p):
+        return None
+    ensure_all_user_csv(user_id)
+    with open(p, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        row = next(r, None)
+    if not row:
+        return None
+
+    mk = (row.get("model_key") or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY
+    if mk not in MODELS:
+        mk = DEFAULT_MODEL_KEY
+
+    return {
+        "user_id": (row.get("user_id") or user_id).strip() or user_id,
+        "password": row.get("password") or "",
+        "model_key": mk,
+        "created_at": row.get("created_at") or datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def save_user(u: Dict[str, str]) -> None:
+    ensure_all_user_csv(u["user_id"])
+    p = user_csv_path(u["user_id"])
+    lk = _lock_for_path(p)
+    with lk:
+        with open(p, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=USER_FIELDS)
+            w.writeheader()
+            w.writerow({
+                "user_id": u["user_id"],
+                "password": u.get("password", ""),
+                "model_key": u.get("model_key", DEFAULT_MODEL_KEY),
+                "created_at": u.get("created_at", ""),
+            })
+
+
+def verify_user(user_id: str, password: str) -> bool:
+    u = load_user(user_id)
+    return bool(u and u.get("password", "") == password)
+
+
+def create_user_files(user_id: str, password: str) -> None:
+    ensure_all_user_csv(user_id)
+    p = user_csv_path(user_id)
+    lk = _lock_for_path(p)
+    with lk:
+        with open(p, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=USER_FIELDS)
+            w.writeheader()
+            w.writerow({
+                "user_id": user_id,
+                "password": password,
+                "model_key": DEFAULT_MODEL_KEY,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            })
+
+
+def resolve_api_key(model_key: str) -> str:
+    env_key = MODELS[model_key]["api_key_env"]
+    return (os.environ.get(env_key) or "").strip() or DEFAULT_DIFY_API_KEY
+
+
+def _last_prune_path(user_id: str) -> str:
+    return os.path.join(user_dir(user_id), ".last_prune.txt")
+
+
+def _read_last_prune(user_id: str) -> str:
+    p = _last_prune_path(user_id)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return (f.read() or "").strip()
+    except Exception:
+        return ""
+
+
+def _write_last_prune(user_id: str, ymd: str) -> None:
+    p = _last_prune_path(user_id)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(ymd)
+    except Exception:
+        pass
+
+
+def prune_history_14days(user_id: str) -> None:
+    ensure_all_user_csv(user_id)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _read_last_prune(user_id) == today:
+        return
+
+    cutoff = datetime.now() - timedelta(days=14)
+    path = history_csv_path(user_id)
+
+    kept: List[Dict[str, str]] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            ts = (row.get("timestamp") or "").strip()
+            try:
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                kept.append({k: row.get(k, "") for k in HISTORY_FIELDS})
+                continue
+            if dt >= cutoff:
+                kept.append({k: row.get(k, "") for k in HISTORY_FIELDS})
+
+    csv_write_dicts_atomic(path, HISTORY_FIELDS, kept)
+    _write_last_prune(user_id, today)
+
+
+def append_history(user_id: str, role: str, model_key: str, thread_id: str, dify_cid: str, content: str) -> str:
+    ensure_all_user_csv(user_id)
+    ts = datetime.now().isoformat(timespec="seconds")
+    csv_append_row(history_csv_path(user_id), [ts, role, model_key, thread_id, dify_cid or "", content])
+    prune_history_14days(user_id)
+    return ts
+
+
+def read_history(user_id: str, thread_id: Optional[str], limit: int = 200) -> List[Dict[str, str]]:
+    if not thread_id:
+        return []
+    ensure_all_user_csv(user_id)
+    rows = csv_read_dicts_cached(history_csv_path(user_id), HISTORY_FIELDS)
+    tid = thread_id.strip()
+    out: List[Dict[str, str]] = []
+    for row in rows:
+        if (row.get("thread_id") or "").strip() != tid:
+            continue
+        out.append({
+            "timestamp": row.get("timestamp") or "",
+            "role": row.get("role") or "",
+            "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
+            "thread_id": tid,
+            "content": row.get("content") or "",
+        })
+    if len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
+def read_history_all(user_id: str, thread_id: Optional[str]) -> List[Dict[str, str]]:
+    if not thread_id:
+        return []
+    ensure_all_user_csv(user_id)
+    rows = csv_read_dicts_cached(history_csv_path(user_id), HISTORY_FIELDS)
+    tid = thread_id.strip()
+    out: List[Dict[str, str]] = []
+    for row in rows:
+        if (row.get("thread_id") or "").strip() != tid:
+            continue
+        out.append({
+            "timestamp": row.get("timestamp") or "",
+            "role": row.get("role") or "",
+            "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
+            "thread_id": tid,
+            "content": row.get("content") or "",
+        })
+    return out
+
+
+def _load_threads(user_id: str) -> List[Dict[str, str]]:
+    ensure_all_user_csv(user_id)
+    rows = csv_read_dicts_cached(threads_csv_path(user_id), THREAD_FIELDS)
+    out: List[Dict[str, str]] = []
+    for row in rows:
+        tid = (row.get("thread_id") or "").strip()
+        if not tid:
+            continue
+        out.append({k: row.get(k, "") for k in THREAD_FIELDS})
+    return out
+
+
+def _save_threads(user_id: str, rows: List[Dict[str, str]]) -> None:
+    csv_write_dicts_atomic(threads_csv_path(user_id), THREAD_FIELDS, rows)
+
+
+def upsert_thread(user_id: str, thread_id: str, preview: str, updated_at: str) -> None:
+    rows = _load_threads(user_id)
+    for r in rows:
+        if (r.get("thread_id") or "") == thread_id:
+            if preview and not (r.get("preview") or "").strip():
+                r["preview"] = preview
+            r["updated_at"] = updated_at
+            _save_threads(user_id, rows)
+            return
+    rows.append({
+        "thread_id": thread_id,
+        "name": "",
+        "preview": preview,
+        "created_at": updated_at,
+        "updated_at": updated_at,
+    })
+    _save_threads(user_id, rows)
+
+
+def list_threads(user_id: str, limit: int = 100) -> List[Dict[str, str]]:
+    rows = _load_threads(user_id)
+    rows.sort(key=lambda x: (x.get("updated_at") or ""), reverse=True)
+    return rows[:limit]
+
+
+def rename_thread(user_id: str, thread_id: str, name: str) -> bool:
+    name = (name or "").strip()
+    if not thread_id or not name:
+        return False
+    rows = _load_threads(user_id)
+    for r in rows:
+        if (r.get("thread_id") or "") == thread_id:
+            r["name"] = name
+            r["preview"] = name[:20]
+            r["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            _save_threads(user_id, rows)
+            return True
+    return False
+
+
+def delete_thread(user_id: str, thread_id: str) -> bool:
+    if not thread_id:
+        return False
+
+    rows = _load_threads(user_id)
+    new_rows = [r for r in rows if (r.get("thread_id") or "") != thread_id]
+    if len(new_rows) == len(rows):
+        return False
+    _save_threads(user_id, new_rows)
+
+    kept: List[Dict[str, str]] = []
+    with open(history_csv_path(user_id), newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if (row.get("thread_id") or "").strip() == thread_id:
+                continue
+            kept.append({k: row.get(k, "") for k in HISTORY_FIELDS})
+    csv_write_dicts_atomic(history_csv_path(user_id), HISTORY_FIELDS, kept)
+
+    kept2: List[Dict[str, str]] = []
+    with open(map_csv_path(user_id), newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if (row.get("thread_id") or "").strip() == thread_id:
+                continue
+            kept2.append({k: row.get(k, "") for k in MAP_FIELDS})
+    csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, kept2)
+
+    return True
+
+
+def _load_map(user_id: str) -> List[Dict[str, str]]:
+    ensure_all_user_csv(user_id)
+    rows = csv_read_dicts_cached(map_csv_path(user_id), MAP_FIELDS)
+    out: List[Dict[str, str]] = []
+    for row in rows:
+        tid = (row.get("thread_id") or "").strip()
+        mk = (row.get("model_key") or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY
+        if not tid or not mk:
+            continue
+        out.append({
+            "thread_id": tid,
+            "model_key": mk,
+            "dify_conversation_id": (row.get("dify_conversation_id") or "").strip(),
+            "updated_at": row.get("updated_at") or "",
+        })
+    return out
+
+
+def get_dify_cid(user_id: str, thread_id: str, model_key: str) -> str:
+    rows = _load_map(user_id)
+    for r in rows:
+        if r["thread_id"] == thread_id and r["model_key"] == model_key:
+            return r.get("dify_conversation_id") or ""
+    return ""
+
+
+def set_dify_cid(user_id: str, thread_id: str, model_key: str, dify_cid: str, updated_at: str) -> None:
+    rows = _load_map(user_id)
+    for r in rows:
+        if r["thread_id"] == thread_id and r["model_key"] == model_key:
+            r["dify_conversation_id"] = dify_cid
+            r["updated_at"] = updated_at
+            csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, rows)
+            return
+    rows.append({
+        "thread_id": thread_id,
+        "model_key": model_key,
+        "dify_conversation_id": dify_cid,
+        "updated_at": updated_at,
+    })
+    csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, rows)
 
 
 def feedback_state_csv_path(dir_path: str) -> str:
@@ -189,24 +557,20 @@ def _feedback_key(user_id: str, model_key: str, thread_id: str, bot_ts: str) -> 
 def _load_feedback_state_from(dir_path: str) -> List[Dict[str, str]]:
     ensure_feedback_state_csv(dir_path)
     path = feedback_state_csv_path(dir_path)
-    out: List[Dict[str, str]] = []
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            out.append({k: row.get(k, "") for k in FEEDBACK_FIELDS})
-    return out
+    lk = _lock_for_path(path)
+    with lk:
+        out: List[Dict[str, str]] = []
+        with open(path, newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                out.append({k: row.get(k, "") for k in FEEDBACK_FIELDS})
+        return out
 
 
 def _save_feedback_state_to(dir_path: str, rows: List[Dict[str, str]]) -> None:
     ensure_feedback_state_csv(dir_path)
     path = feedback_state_csv_path(dir_path)
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=FEEDBACK_FIELDS)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in FEEDBACK_FIELDS})
-    os.replace(tmp, path)
+    csv_write_dicts_atomic(path, FEEDBACK_FIELDS, rows)
 
 
 def _merge_feedback_rows(primary: List[Dict[str, str]], secondary: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -322,8 +686,10 @@ def append_feedback_md(
     ensure_dir(dir_path)
     ym = _yyyymm_from_iso(saved_at)
     path = _feedback_md_path(dir_path, model_key, kind, ym)
-    with open(path, "a", encoding="utf-8", newline="\n") as f:
-        f.write(_md_chunk(saved_at, user_id, model_key, question, answer))
+    lk = _lock_for_path(path)
+    with lk:
+        with open(path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(_md_chunk(saved_at, user_id, model_key, question, answer))
     return ym
 
 
@@ -367,16 +733,18 @@ def rebuild_feedback_md_for_model_months_in_dir(
         lst.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
         path = _feedback_md_path(dir_path, mk, kind, ym)
         tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            for r in lst:
-                f.write(_md_chunk(
-                    r.get("saved_at", ""),
-                    r.get("user_id", ""),
-                    r.get("model_key", ""),
-                    r.get("question", ""),
-                    r.get("answer", ""),
-                ))
-        os.replace(tmp, path)
+        lk = _lock_for_path(path)
+        with lk:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                for r in lst:
+                    f.write(_md_chunk(
+                        r.get("saved_at", ""),
+                        r.get("user_id", ""),
+                        r.get("model_key", ""),
+                        r.get("question", ""),
+                        r.get("answer", ""),
+                    ))
+            os.replace(tmp, path)
 
 
 def mark_dirty_month(model_key: str, yyyymm: str) -> None:
@@ -395,18 +763,15 @@ def maybe_rebuild_dirty_months(dir_path: str, model_key: str) -> None:
         last = _last_md_rebuild_at.get(model_key, 0.0)
         if (now - last) < MD_REBUILD_COOLDOWN_SEC:
             return
-
         months = set(dirty)
         _dirty_months_by_model[model_key] = set()
         _last_md_rebuild_at[model_key] = now
-
     rebuild_feedback_md_for_model_months_in_dir(dir_path, model_key, months)
 
 
 def sync_local_spool_to_nas_if_possible() -> None:
     if not is_nas_available_cached():
         return
-
     local_csv = feedback_state_csv_path(FEEDBACK_DIR_LOCAL)
     if not os.path.exists(local_csv):
         return
@@ -477,373 +842,6 @@ def list_feedback_state_for_user_thread(
     return out
 
 
-def user_dir(user_id: str) -> str:
-    return os.path.join(USERS_DIR, user_id)
-
-
-def user_csv_path(user_id: str) -> str:
-    return os.path.join(user_dir(user_id), "user.csv")
-
-
-def history_csv_path(user_id: str) -> str:
-    return os.path.join(user_dir(user_id), "history.csv")
-
-
-def threads_csv_path(user_id: str) -> str:
-    return os.path.join(user_dir(user_id), "threads.csv")
-
-
-def map_csv_path(user_id: str) -> str:
-    return os.path.join(user_dir(user_id), "thread_map.csv")
-
-
-def ensure_user_dir(user_id: str) -> None:
-    os.makedirs(user_dir(user_id), exist_ok=True)
-
-
-def ensure_csv(path: str, fieldnames: List[str]) -> None:
-    if os.path.exists(path):
-        return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-
-
-def ensure_all_csv(user_id: str) -> None:
-    ensure_user_dir(user_id)
-    ensure_csv(history_csv_path(user_id), HISTORY_FIELDS)
-    ensure_csv(threads_csv_path(user_id), THREAD_FIELDS)
-    ensure_csv(map_csv_path(user_id), MAP_FIELDS)
-
-
-def user_exists(user_id: str) -> bool:
-    return os.path.exists(user_csv_path(user_id))
-
-
-def load_user(user_id: str) -> Optional[Dict[str, str]]:
-    if not os.path.exists(user_csv_path(user_id)):
-        return None
-    ensure_all_csv(user_id)
-    with open(user_csv_path(user_id), newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        row = next(r, None)
-    if not row:
-        return None
-
-    mk = (row.get("model_key") or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY
-    if mk not in MODELS:
-        mk = DEFAULT_MODEL_KEY
-
-    return {
-        "user_id": (row.get("user_id") or user_id).strip() or user_id,
-        "password": row.get("password") or "",
-        "model_key": mk,
-        "created_at": row.get("created_at") or datetime.now().isoformat(timespec="seconds"),
-    }
-
-
-def save_user(u: Dict[str, str]) -> None:
-    ensure_all_csv(u["user_id"])
-    with open(user_csv_path(u["user_id"]), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=USER_FIELDS)
-        w.writeheader()
-        w.writerow({
-            "user_id": u["user_id"],
-            "password": u.get("password", ""),
-            "model_key": u.get("model_key", DEFAULT_MODEL_KEY),
-            "created_at": u.get("created_at", ""),
-        })
-
-
-def verify_user(user_id: str, password: str) -> bool:
-    u = load_user(user_id)
-    return bool(u and u.get("password", "") == password)
-
-
-def create_user_files(user_id: str, password: str) -> None:
-    ensure_all_csv(user_id)
-    with open(user_csv_path(user_id), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=USER_FIELDS)
-        w.writeheader()
-        w.writerow({
-            "user_id": user_id,
-            "password": password,
-            "model_key": DEFAULT_MODEL_KEY,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        })
-
-
-def resolve_api_key(model_key: str) -> str:
-    env_key = MODELS[model_key]["api_key_env"]
-    return (os.environ.get(env_key) or "").strip() or DEFAULT_DIFY_API_KEY
-
-
-def _last_prune_path(user_id: str) -> str:
-    return os.path.join(user_dir(user_id), ".last_prune.txt")
-
-
-def _read_last_prune(user_id: str) -> str:
-    p = _last_prune_path(user_id)
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return (f.read() or "").strip()
-    except Exception:
-        return ""
-
-
-def _write_last_prune(user_id: str, ymd: str) -> None:
-    p = _last_prune_path(user_id)
-    try:
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(ymd)
-    except Exception:
-        pass
-
-
-def prune_history_14days(user_id: str) -> None:
-    ensure_all_csv(user_id)
-    today = datetime.now().strftime("%Y-%m-%d")
-    if _read_last_prune(user_id) == today:
-        return
-
-    cutoff = datetime.now() - timedelta(days=14)
-
-    path = history_csv_path(user_id)
-    kept: List[Dict[str, str]] = []
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            ts = (row.get("timestamp") or "").strip()
-            try:
-                dt = datetime.fromisoformat(ts)
-            except Exception:
-                kept.append({
-                    "timestamp": row.get("timestamp") or "",
-                    "role": row.get("role") or "",
-                    "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
-                    "thread_id": row.get("thread_id") or "",
-                    "dify_conversation_id": row.get("dify_conversation_id") or "",
-                    "content": row.get("content") or "",
-                })
-                continue
-
-            if dt >= cutoff:
-                kept.append({
-                    "timestamp": row.get("timestamp") or "",
-                    "role": row.get("role") or "",
-                    "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
-                    "thread_id": row.get("thread_id") or "",
-                    "dify_conversation_id": row.get("dify_conversation_id") or "",
-                    "content": row.get("content") or "",
-                })
-
-    csv_write_dicts_atomic(path, HISTORY_FIELDS, kept)
-    _write_last_prune(user_id, today)
-
-
-def append_history(user_id: str, role: str, model_key: str, thread_id: str, dify_cid: str, content: str) -> str:
-    ensure_all_csv(user_id)
-    ts = datetime.now().isoformat(timespec="seconds")
-    with open(history_csv_path(user_id), "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([ts, role, model_key, thread_id, dify_cid or "", content])
-    _csv_cache().pop(f"read::{history_csv_path(user_id)}", None)
-    prune_history_14days(user_id)
-    return ts
-
-
-def read_history(user_id: str, thread_id: Optional[str], limit: int = 200) -> List[Dict[str, str]]:
-    if not thread_id:
-        return []
-    ensure_all_csv(user_id)
-    path = history_csv_path(user_id)
-    rows = csv_read_dicts_cached(path, HISTORY_FIELDS)
-
-    out: List[Dict[str, str]] = []
-    tid = thread_id.strip()
-    for row in rows:
-        if (row.get("thread_id") or "").strip() != tid:
-            continue
-        out.append({
-            "timestamp": row.get("timestamp") or "",
-            "role": row.get("role") or "",
-            "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
-            "thread_id": tid,
-            "content": row.get("content") or "",
-        })
-
-    if len(out) > limit:
-        out = out[-limit:]
-    return out
-
-
-def read_history_all(user_id: str, thread_id: Optional[str]) -> List[Dict[str, str]]:
-    if not thread_id:
-        return []
-    ensure_all_csv(user_id)
-    path = history_csv_path(user_id)
-    rows = csv_read_dicts_cached(path, HISTORY_FIELDS)
-
-    out: List[Dict[str, str]] = []
-    tid = thread_id.strip()
-    for row in rows:
-        if (row.get("thread_id") or "").strip() != tid:
-            continue
-        out.append({
-            "timestamp": row.get("timestamp") or "",
-            "role": row.get("role") or "",
-            "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
-            "thread_id": tid,
-            "content": row.get("content") or "",
-        })
-    return out
-
-
-def _load_threads(user_id: str) -> List[Dict[str, str]]:
-    ensure_all_csv(user_id)
-    path = threads_csv_path(user_id)
-    rows = csv_read_dicts_cached(path, THREAD_FIELDS)
-    out: List[Dict[str, str]] = []
-    for row in rows:
-        tid = (row.get("thread_id") or "").strip()
-        if not tid:
-            continue
-        out.append({
-            "thread_id": tid,
-            "name": row.get("name") or "",
-            "preview": row.get("preview") or "",
-            "created_at": row.get("created_at") or "",
-            "updated_at": row.get("updated_at") or "",
-        })
-    return out
-
-
-def _save_threads(user_id: str, rows: List[Dict[str, str]]) -> None:
-    csv_write_dicts_atomic(threads_csv_path(user_id), THREAD_FIELDS, rows)
-
-
-def upsert_thread(user_id: str, thread_id: str, preview: str, updated_at: str) -> None:
-    rows = _load_threads(user_id)
-    for r in rows:
-        if r["thread_id"] == thread_id:
-            if preview and not (r.get("preview") or "").strip():
-                r["preview"] = preview
-            r["updated_at"] = updated_at
-            _save_threads(user_id, rows)
-            return
-    rows.append({
-        "thread_id": thread_id,
-        "name": "",
-        "preview": preview,
-        "created_at": updated_at,
-        "updated_at": updated_at,
-    })
-    _save_threads(user_id, rows)
-
-
-def list_threads(user_id: str, limit: int = 100) -> List[Dict[str, str]]:
-    rows = _load_threads(user_id)
-    rows.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-    return rows[:limit]
-
-
-def rename_thread(user_id: str, thread_id: str, name: str) -> bool:
-    name = (name or "").strip()
-    if not thread_id or not name:
-        return False
-    rows = _load_threads(user_id)
-    for r in rows:
-        if r["thread_id"] == thread_id:
-            r["name"] = name
-            r["preview"] = name[:20]
-            r["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            _save_threads(user_id, rows)
-            return True
-    return False
-
-
-def delete_thread(user_id: str, thread_id: str) -> bool:
-    if not thread_id:
-        return False
-    rows = _load_threads(user_id)
-    new_rows = [r for r in rows if r["thread_id"] != thread_id]
-    if len(new_rows) == len(rows):
-        return False
-    _save_threads(user_id, new_rows)
-
-    kept: List[Dict[str, str]] = []
-    with open(history_csv_path(user_id), newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if (row.get("thread_id") or "").strip() == thread_id:
-                continue
-            kept.append({
-                "timestamp": row.get("timestamp") or "",
-                "role": row.get("role") or "",
-                "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
-                "thread_id": (row.get("thread_id") or "").strip(),
-                "dify_conversation_id": (row.get("dify_conversation_id") or "").strip(),
-                "content": row.get("content") or "",
-            })
-    csv_write_dicts_atomic(history_csv_path(user_id), HISTORY_FIELDS, kept)
-
-    kept2: List[Dict[str, str]] = []
-    with open(map_csv_path(user_id), newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if (row.get("thread_id") or "").strip() == thread_id:
-                continue
-            kept2.append({
-                "thread_id": (row.get("thread_id") or "").strip(),
-                "model_key": (row.get("model_key") or DEFAULT_MODEL_KEY).strip(),
-                "dify_conversation_id": (row.get("dify_conversation_id") or "").strip(),
-                "updated_at": row.get("updated_at") or "",
-            })
-    csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, kept2)
-
-    return True
-
-
-def _load_map(user_id: str) -> List[Dict[str, str]]:
-    ensure_all_csv(user_id)
-    path = map_csv_path(user_id)
-    rows = csv_read_dicts_cached(path, MAP_FIELDS)
-    out: List[Dict[str, str]] = []
-    for row in rows:
-        out.append({
-            "thread_id": (row.get("thread_id") or "").strip(),
-            "model_key": (row.get("model_key") or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY,
-            "dify_conversation_id": (row.get("dify_conversation_id") or "").strip(),
-            "updated_at": row.get("updated_at") or "",
-        })
-    return [x for x in out if x["thread_id"] and x["model_key"]]
-
-
-def get_dify_cid(user_id: str, thread_id: str, model_key: str) -> str:
-    rows = _load_map(user_id)
-    for r in rows:
-        if r["thread_id"] == thread_id and r["model_key"] == model_key:
-            return r["dify_conversation_id"] or ""
-    return ""
-
-
-def set_dify_cid(user_id: str, thread_id: str, model_key: str, dify_cid: str, updated_at: str) -> None:
-    rows = _load_map(user_id)
-    for r in rows:
-        if r["thread_id"] == thread_id and r["model_key"] == model_key:
-            r["dify_conversation_id"] = dify_cid
-            r["updated_at"] = updated_at
-            csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, rows)
-            return
-    rows.append({
-        "thread_id": thread_id,
-        "model_key": model_key,
-        "dify_conversation_id": dify_cid,
-        "updated_at": updated_at,
-    })
-    csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, rows)
-
-
 def sse_pack(event: str, data_obj: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data_obj, ensure_ascii=False)}\n\n"
 
@@ -864,15 +862,88 @@ def iter_dify_sse(resp: requests.Response) -> Iterable[Dict[str, Any]]:
             continue
 
 
+def maintenance_backup_and_rotation() -> None:
+    ensure_dir(BACKUP_DIR)
+
+    day = datetime.now().strftime("%Y%m%d")
+    day_dir = os.path.join(BACKUP_DIR, day)
+    ensure_dir(day_dir)
+
+    def copy_if_exists(src: str, dst: str) -> None:
+        try:
+            if os.path.exists(src):
+                ensure_dir(os.path.dirname(dst))
+                shutil.copy2(src, dst)
+        except Exception:
+            pass
+
+    try:
+        if os.path.isdir(USERS_DIR):
+            for uid in os.listdir(USERS_DIR):
+                udir = os.path.join(USERS_DIR, uid)
+                if not os.path.isdir(udir):
+                    continue
+                for fn in ("user.csv", "history.csv", "threads.csv", "thread_map.csv", ".last_prune.txt"):
+                    src = os.path.join(udir, fn)
+                    dst = os.path.join(day_dir, "users", uid, fn)
+                    copy_if_exists(src, dst)
+    except Exception:
+        pass
+
+    try:
+        src = feedback_state_csv_path(FEEDBACK_DIR_LOCAL)
+        dst = os.path.join(day_dir, "spool", "good_and_bad", FEEDBACK_STATE_NAME)
+        copy_if_exists(src, dst)
+    except Exception:
+        pass
+
+    try:
+        cutoff = datetime.now() - timedelta(days=BACKUP_KEEP_DAYS)
+        for name in os.listdir(BACKUP_DIR):
+            p = os.path.join(BACKUP_DIR, name)
+            if not os.path.isdir(p):
+                continue
+            try:
+                dt = datetime.strptime(name, "%Y%m%d")
+            except Exception:
+                continue
+            if dt < cutoff:
+                try:
+                    shutil.rmtree(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def maybe_run_maintenance() -> None:
+    global _last_maintenance_at
+    now = time.time()
+    with _maintenance_lock:
+        if (now - _last_maintenance_at) < MAINTENANCE_TTL_SEC:
+            return
+        _last_maintenance_at = now
+    maintenance_backup_and_rotation()
+
+
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 
-os.makedirs(USERS_DIR, exist_ok=True)
+ensure_dir(USERS_DIR)
 ensure_notice_file()
 ensure_dir(FEEDBACK_DIR_LOCAL)
 ensure_feedback_state_csv(FEEDBACK_DIR_LOCAL)
 if is_nas_available_cached():
     ensure_feedback_state_csv(FEEDBACK_DIR_NAS)
+ensure_dir(BACKUP_DIR)
+
+
+@app.before_request
+def _before():
+    try:
+        maybe_run_maintenance()
+    except Exception:
+        pass
 
 
 def login_required(fn):
@@ -998,6 +1069,47 @@ def api_history():
     return jsonify({"items": items})
 
 
+@app.get("/api/export")
+@api_login_required
+def api_export_csv():
+    u = load_user(session["user_id"])
+    if not u:
+        session.clear()
+        return jsonify({"error": "user not found"}), 401
+
+    tid = (request.args.get("thread_id") or "").strip()
+    if not tid:
+        return jsonify({"error": "thread_id is required"}), 400
+
+    threads = _load_threads(u["user_id"])
+    if not any((t.get("thread_id") or "") == tid for t in threads):
+        return jsonify({"error": "thread not found"}), 404
+
+    items = read_history_all(u["user_id"], tid)
+
+    sio = io.StringIO()
+    w = csv.writer(sio, lineterminator="\n")
+    w.writerow(["timestamp", "role", "model_key", "thread_id", "content"])
+    for m in items:
+        w.writerow([
+            m.get("timestamp", ""),
+            m.get("role", ""),
+            m.get("model_key", ""),
+            m.get("thread_id", ""),
+            m.get("content", ""),
+        ])
+
+    csv_text = "\ufeff" + sio.getvalue()
+    return Response(
+        csv_text,
+        mimetype="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="chat.csv"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @app.get("/api/threads")
 @api_login_required
 def api_threads():
@@ -1055,6 +1167,7 @@ def api_thread_delete():
 @app.get("/api/notice")
 @api_login_required
 def api_notice():
+    ensure_notice_file()
     try:
         st = os.stat(NOTICE_PATH)
         version = str(int(st.st_mtime))
@@ -1266,7 +1379,6 @@ def api_chat_stream():
         except Exception as e:
             yield sse_pack("error", {"message": str(e)})
 
-    # ★ここが修正点：stream_with_contextで包む
     return Response(stream_with_context(generate()), mimetype="text/event-stream", headers={
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
