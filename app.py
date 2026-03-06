@@ -23,11 +23,12 @@ USERS_DIR = os.path.join(BASE_DIR, "users")
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-me")
 
 DIFY_API_BASE = (os.environ.get("DIFY_API_BASE") or "http://161.93.108.55:8890/v1").rstrip("/")
-DEFAULT_DIFY_API_KEY = os.environ.get("DIFY_API_KEY") or ""
+DEFAULT_DIFY_API_KEY = (os.environ.get("DIFY_API_KEY") or "").strip()
 
 ID7_RE = re.compile(r"^\d{7}$")
 DEFAULT_MODEL_KEY = "seisan"
 
+# ★ユーザー指定のMODELSに更新
 MODELS = {
     "seisan":   {"label": "生産モデル 1.04", "api_key_env": "DIFY_API_KEY_SEISAN"},
     "hozen":    {"label": "保全モデル 1.04", "api_key_env": "DIFY_API_KEY_HOZEN"},
@@ -47,8 +48,9 @@ MAP_FIELDS = ["thread_id", "model_key", "dify_conversation_id", "updated_at"]
 
 NOTICE_PATH = os.path.join(BASE_DIR, "notice.txt")
 
-# ---- Feedback (RAG用) ----
-FEEDBACK_DIR = os.path.join(BASE_DIR, "rag_feedback_md")
+# ---- Feedback (RAG用) 保存先: NAS（UNCパス）----
+# Windows実行を前提。Linuxの場合はcifsマウント先パスに置換してください。
+FEEDBACK_DIR = r"\\172.27.23.54\disk1\Chuppy\good_and_bad"
 FEEDBACK_STATE_CSV = os.path.join(FEEDBACK_DIR, "feedback_state.csv")
 FEEDBACK_FIELDS = ["user_id", "model_key", "thread_id", "bot_ts", "kind", "saved_at", "question", "answer"]
 
@@ -64,10 +66,8 @@ def ensure_notice_file() -> None:
 
 
 def ensure_feedback_dir() -> None:
-    try:
-        os.makedirs(FEEDBACK_DIR, exist_ok=True)
-    except Exception:
-        pass
+    # NASに書けない場合は例外を上げて検知できるようにする
+    os.makedirs(FEEDBACK_DIR, exist_ok=True)
 
 
 def ensure_feedback_state_csv() -> None:
@@ -85,8 +85,6 @@ def _safe_filename_part(s: str) -> str:
 
 
 def _yyyymm_from_iso(iso: str) -> str:
-    # 期待値: YYYY-MM-DDTHH:MM:SS
-    # 失敗したら現在月
     try:
         dt = datetime.fromisoformat((iso or "").strip())
         return dt.strftime("%Y%m")
@@ -185,10 +183,8 @@ def rebuild_feedback_md_for_model(model_key: str) -> None:
     rows = _load_feedback_state()
     mk = model_key
 
-    # 対象モデルだけ抽出
     items = [r for r in rows if r.get("model_key") == mk and r.get("kind") in ("good", "bad")]
 
-    # (kind, yyyymm) -> list
     buckets: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
     for r in items:
         ym = _yyyymm_from_iso(r.get("saved_at", ""))
@@ -207,13 +203,10 @@ def rebuild_feedback_md_for_model(model_key: str) -> None:
             f"{(r.get('answer') or '').rstrip()}\n"
         )
 
-    # まず、このモデルの既存 md を一旦クリアしたいので、
-    # rag_feedback_md 配下の該当パターンを削除（安全のため model prefix で限定）
     mk_safe = _safe_filename_part(mk)
     try:
         for fn in os.listdir(FEEDBACK_DIR):
             if fn.startswith(mk_safe + "_") and fn.endswith(".md"):
-                # mk_good_yyyymm.md / mk_bad_yyyymm.md 想定
                 p = os.path.join(FEEDBACK_DIR, fn)
                 try:
                     os.remove(p)
@@ -222,7 +215,6 @@ def rebuild_feedback_md_for_model(model_key: str) -> None:
     except Exception:
         pass
 
-    # バケットごとに再生成
     for (kind, ym), lst in buckets.items():
         lst.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
         path = _feedback_md_path(mk, kind, ym)
@@ -626,6 +618,7 @@ def iter_dify_sse(resp: requests.Response) -> Iterable[Dict[str, Any]]:
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
+
 os.makedirs(USERS_DIR, exist_ok=True)
 ensure_notice_file()
 ensure_feedback_dir()
@@ -996,7 +989,7 @@ def api_chat_stream():
 
         except requests.HTTPError as e:
             try:
-                body_txt = r.text  # noqa
+                body_txt = r.text  # noqa: F821
             except Exception:
                 body_txt = str(e)
             yield sse_pack("error", {"message": body_txt})
@@ -1016,4 +1009,4 @@ def ping():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5200, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5201, debug=False, threaded=True)
