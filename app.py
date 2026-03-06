@@ -28,7 +28,6 @@ DEFAULT_DIFY_API_KEY = (os.environ.get("DIFY_API_KEY") or "").strip()
 ID7_RE = re.compile(r"^\d{7}$")
 DEFAULT_MODEL_KEY = "seisan"
 
-# ★ユーザー指定のMODELSに更新
 MODELS = {
     "seisan":   {"label": "生産モデル 1.04", "api_key_env": "DIFY_API_KEY_SEISAN"},
     "hozen":    {"label": "保全モデル 1.04", "api_key_env": "DIFY_API_KEY_HOZEN"},
@@ -48,8 +47,6 @@ MAP_FIELDS = ["thread_id", "model_key", "dify_conversation_id", "updated_at"]
 
 NOTICE_PATH = os.path.join(BASE_DIR, "notice.txt")
 
-# ---- Feedback (RAG用) 保存先: NAS（UNCパス）----
-# Windows実行を前提。Linuxの場合はcifsマウント先パスに置換してください。
 FEEDBACK_DIR = r"\\172.27.23.54\disk1\Chuppy\good_and_bad"
 FEEDBACK_STATE_CSV = os.path.join(FEEDBACK_DIR, "feedback_state.csv")
 FEEDBACK_FIELDS = ["user_id", "model_key", "thread_id", "bot_ts", "kind", "saved_at", "question", "answer"]
@@ -66,7 +63,6 @@ def ensure_notice_file() -> None:
 
 
 def ensure_feedback_dir() -> None:
-    # NASに書けない場合は例外を上げて検知できるようにする
     os.makedirs(FEEDBACK_DIR, exist_ok=True)
 
 
@@ -130,7 +126,7 @@ def upsert_feedback_state(
     model_key: str,
     thread_id: str,
     bot_ts: str,
-    kind: str,      # "good" | "bad" | "none"
+    kind: str,
     saved_at: str,
     question: str,
     answer: str,
@@ -148,7 +144,7 @@ def upsert_feedback_state(
 
         found = True
         if kind == "none":
-            continue  # 取り消し＝削除
+            continue
 
         r2 = dict(r)
         r2["kind"] = kind
@@ -173,12 +169,6 @@ def upsert_feedback_state(
 
 
 def rebuild_feedback_md_for_model(model_key: str) -> None:
-    """
-    model_key の現在状態から、
-      {model}_good_yyyymm.md
-      {model}_bad_yyyymm.md
-    を月別に全て再生成（上書き）する。
-    """
     ensure_feedback_dir()
     rows = _load_feedback_state()
     mk = model_key
@@ -223,6 +213,33 @@ def rebuild_feedback_md_for_model(model_key: str) -> None:
             for r in lst:
                 f.write(one_chunk(r))
         os.replace(tmp, path)
+
+
+def list_feedback_state_for_user_thread(
+    *,
+    user_id: str,
+    thread_id: str,
+    model_key: Optional[str],
+) -> List[Dict[str, str]]:
+    rows = _load_feedback_state()
+    out: List[Dict[str, str]] = []
+    for r in rows:
+        if (r.get("user_id") or "") != user_id:
+            continue
+        if (r.get("thread_id") or "") != thread_id:
+            continue
+        if model_key and (r.get("model_key") or "") != model_key:
+            continue
+        kind = (r.get("kind") or "").strip().lower()
+        if kind not in ("good", "bad"):
+            continue
+        out.append({
+            "bot_ts": r.get("bot_ts", ""),
+            "kind": kind,
+            "model_key": r.get("model_key", ""),
+            "saved_at": r.get("saved_at", ""),
+        })
+    return out
 
 
 def user_dir(user_id: str) -> str:
@@ -858,6 +875,34 @@ def api_notice():
     return jsonify({"version": version, "content": content})
 
 
+@app.get("/api/feedback/state")
+@api_login_required
+def api_feedback_state():
+    u = load_user(session["user_id"])
+    if not u:
+        session.clear()
+        return jsonify({"error": "user not found"}), 401
+
+    thread_id = (request.args.get("thread_id") or "").strip()
+    model_key = (request.args.get("model_key") or "").strip() or None
+
+    if not thread_id:
+        return jsonify({"error": "thread_id required"}), 400
+    if model_key and model_key not in MODELS:
+        model_key = None
+
+    try:
+        items = list_feedback_state_for_user_thread(
+            user_id=u["user_id"],
+            thread_id=thread_id,
+            model_key=model_key,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"items": items})
+
+
 @app.post("/api/feedback")
 @api_login_required
 def api_feedback():
@@ -868,7 +913,7 @@ def api_feedback():
 
     data = request.get_json(force=True)
 
-    kind = (data.get("kind") or "").strip().lower()  # good / bad / none
+    kind = (data.get("kind") or "").strip().lower()
     model_key = (data.get("model_key") or u["model_key"] or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY
     thread_id = (data.get("thread_id") or "").strip()
     bot_ts = (data.get("bot_ts") or "").strip()
@@ -989,7 +1034,7 @@ def api_chat_stream():
 
         except requests.HTTPError as e:
             try:
-                body_txt = r.text  # noqa: F821
+                body_txt = r.text
             except Exception:
                 body_txt = str(e)
             yield sse_pack("error", {"message": body_txt})
