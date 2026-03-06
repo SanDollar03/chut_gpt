@@ -8,13 +8,13 @@ import time
 from threading import Lock
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Dict, Any, Iterable, Optional, List, Tuple
+from typing import Dict, Any, Iterable, Optional, List, Tuple, Set
 
 import requests
 from dotenv import load_dotenv
 from flask import (
     Flask, render_template, request, jsonify, session, Response,
-    redirect, url_for
+    redirect, url_for, g, stream_with_context
 )
 
 load_dotenv()
@@ -49,34 +49,65 @@ MAP_FIELDS = ["thread_id", "model_key", "dify_conversation_id", "updated_at"]
 
 NOTICE_PATH = os.path.join(BASE_DIR, "notice.txt")
 
-# ===== Feedback / NAS =====
 FEEDBACK_DIR_NAS = r"\\172.27.23.54\disk1\Chuppy\good_and_bad"
-
-# ローカル退避先（NAS障害時）
 FEEDBACK_DIR_LOCAL = os.path.join(BASE_DIR, "_spool", "good_and_bad")
 
 FEEDBACK_STATE_NAME = "feedback_state.csv"
 FEEDBACK_FIELDS = ["user_id", "model_key", "thread_id", "bot_ts", "kind", "saved_at", "question", "answer"]
 
-# ---- md再生成の抑制（P0-2）----
-REBUILD_COOLDOWN_SEC = 10
-_rebuild_lock = Lock()
-_last_rebuild_at: Dict[str, float] = {}
-_dirty_models: Dict[str, bool] = {}
+MD_REBUILD_COOLDOWN_SEC = 10
+_md_lock = Lock()
+_last_md_rebuild_at: Dict[str, float] = {}
+_dirty_months_by_model: Dict[str, Set[str]] = {}
 
-# ---- NAS可用性キャッシュ（毎回のUNCチェックを避ける）----
 _path_lock = Lock()
 _nas_ok_cache: Optional[bool] = None
 _nas_ok_checked_at: float = 0.0
 NAS_CHECK_TTL_SEC = 5
 
 
-def should_rebuild_now(model_key: str) -> bool:
-    now = time.time()
-    last = _last_rebuild_at.get(model_key, 0.0)
-    if not _dirty_models.get(model_key, False):
-        return False
-    return (now - last) >= REBUILD_COOLDOWN_SEC
+def _csv_cache() -> Dict[str, Any]:
+    c = getattr(g, "_csv_cache", None)
+    if c is None:
+        c = {}
+        g._csv_cache = c
+    return c
+
+
+def csv_read_dicts_cached(path: str, fieldnames: List[str]) -> List[Dict[str, str]]:
+    cache = _csv_cache()
+    key = f"read::{path}"
+    if key in cache:
+        return cache[key]
+
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+
+    out: List[Dict[str, str]] = []
+    with open(path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            out.append({k: row.get(k, "") for k in fieldnames})
+
+    cache[key] = out
+    return out
+
+
+def csv_write_dicts_atomic(path: str, fieldnames: List[str], rows: List[Dict[str, str]]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in fieldnames})
+    os.replace(tmp, path)
+    _csv_cache().pop(f"read::{path}", None)
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
 def ensure_notice_file() -> None:
@@ -87,10 +118,6 @@ def ensure_notice_file() -> None:
             f.write("")
     except Exception:
         pass
-
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
 
 
 def is_dir_writable(path: str) -> bool:
@@ -203,8 +230,9 @@ def _merge_feedback_rows(primary: List[Dict[str, str]], secondary: List[Dict[str
 def load_feedback_state_merged() -> List[Dict[str, str]]:
     rows_nas: List[Dict[str, str]] = []
     rows_local: List[Dict[str, str]] = []
+
     try:
-        if os.path.exists(FEEDBACK_DIR_NAS) or is_nas_available_cached():
+        if os.path.exists(feedback_state_csv_path(FEEDBACK_DIR_NAS)) or is_nas_available_cached():
             if os.path.exists(feedback_state_csv_path(FEEDBACK_DIR_NAS)):
                 rows_nas = _load_feedback_state_from(FEEDBACK_DIR_NAS)
     except Exception:
@@ -268,42 +296,72 @@ def upsert_feedback_state_to_dir(
     _save_feedback_state_to(dir_path, out)
 
 
-def rebuild_feedback_md_for_model_in_dir(dir_path: str, model_key: str) -> None:
+def _md_chunk(saved_at: str, user_id: str, model_key: str, question: str, answer: str) -> str:
+    return (
+        "***\n"
+        f"- saved_at: {saved_at}\n"
+        f"- user_id: {user_id}\n"
+        f"- model: {model_key}\n"
+        "## Q\n"
+        f"{(question or '').rstrip()}\n\n"
+        "## A\n"
+        f"{(answer or '').rstrip()}\n"
+    )
+
+
+def append_feedback_md(
+    *,
+    dir_path: str,
+    model_key: str,
+    kind: str,
+    saved_at: str,
+    user_id: str,
+    question: str,
+    answer: str,
+) -> str:
+    ensure_dir(dir_path)
+    ym = _yyyymm_from_iso(saved_at)
+    path = _feedback_md_path(dir_path, model_key, kind, ym)
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(_md_chunk(saved_at, user_id, model_key, question, answer))
+    return ym
+
+
+def rebuild_feedback_md_for_model_months_in_dir(
+    dir_path: str,
+    model_key: str,
+    months: Set[str],
+) -> None:
     ensure_dir(dir_path)
     rows = _load_feedback_state_from(dir_path)
     mk = model_key
 
-    items = [r for r in rows if r.get("model_key") == mk and r.get("kind") in ("good", "bad")]
+    targets = {re.sub(r"\D", "", m)[:6] for m in months if m}
+    targets.discard("")
+    if not targets:
+        return
 
     buckets: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
-    for r in items:
+    for r in rows:
+        if r.get("model_key") != mk:
+            continue
+        kind = (r.get("kind") or "").strip().lower()
+        if kind not in ("good", "bad"):
+            continue
         ym = _yyyymm_from_iso(r.get("saved_at", ""))
-        k = (r.get("kind", ""), ym)
-        buckets.setdefault(k, []).append(r)
-
-    def one_chunk(r: Dict[str, str]) -> str:
-        return (
-            "***\n"
-            f"- saved_at: {r.get('saved_at', '')}\n"
-            f"- user_id: {r.get('user_id', '')}\n"
-            f"- model: {r.get('model_key', '')}\n"
-            "## Q\n"
-            f"{(r.get('question') or '').rstrip()}\n\n"
-            "## A\n"
-            f"{(r.get('answer') or '').rstrip()}\n"
-        )
+        if ym not in targets:
+            continue
+        buckets.setdefault((kind, ym), []).append(r)
 
     mk_safe = _safe_filename_part(mk)
-    try:
-        for fn in os.listdir(dir_path):
-            if fn.startswith(mk_safe + "_") and fn.endswith(".md"):
-                p = os.path.join(dir_path, fn)
+    for ym in targets:
+        for kd in ("good", "bad"):
+            p = os.path.join(dir_path, f"{mk_safe}_{kd}_{ym}.md")
+            if os.path.exists(p):
                 try:
                     os.remove(p)
                 except Exception:
                     pass
-    except Exception:
-        pass
 
     for (kind, ym), lst in buckets.items():
         lst.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
@@ -311,8 +369,38 @@ def rebuild_feedback_md_for_model_in_dir(dir_path: str, model_key: str) -> None:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             for r in lst:
-                f.write(one_chunk(r))
+                f.write(_md_chunk(
+                    r.get("saved_at", ""),
+                    r.get("user_id", ""),
+                    r.get("model_key", ""),
+                    r.get("question", ""),
+                    r.get("answer", ""),
+                ))
         os.replace(tmp, path)
+
+
+def mark_dirty_month(model_key: str, yyyymm: str) -> None:
+    ym = re.sub(r"\D", "", (yyyymm or ""))[:6]
+    if not ym:
+        return
+    _dirty_months_by_model.setdefault(model_key, set()).add(ym)
+
+
+def maybe_rebuild_dirty_months(dir_path: str, model_key: str) -> None:
+    now = time.time()
+    with _md_lock:
+        dirty = _dirty_months_by_model.get(model_key, set())
+        if not dirty:
+            return
+        last = _last_md_rebuild_at.get(model_key, 0.0)
+        if (now - last) < MD_REBUILD_COOLDOWN_SEC:
+            return
+
+        months = set(dirty)
+        _dirty_months_by_model[model_key] = set()
+        _last_md_rebuild_at[model_key] = now
+
+    rebuild_feedback_md_for_model_months_in_dir(dir_path, model_key, months)
 
 
 def sync_local_spool_to_nas_if_possible() -> None:
@@ -327,7 +415,6 @@ def sync_local_spool_to_nas_if_possible() -> None:
         rows_local = _load_feedback_state_from(FEEDBACK_DIR_LOCAL)
     except Exception:
         return
-
     if not rows_local:
         return
 
@@ -337,15 +424,16 @@ def sync_local_spool_to_nas_if_possible() -> None:
         merged = _merge_feedback_rows(rows_nas, rows_local)
         _save_feedback_state_to(FEEDBACK_DIR_NAS, merged)
 
-        mk_set = set()
+        mk_to_months: Dict[str, Set[str]] = {}
         for r in rows_local:
             mk = (r.get("model_key") or "").strip()
-            if mk:
-                mk_set.add(mk)
+            ym = _yyyymm_from_iso(r.get("saved_at", ""))
+            if mk and ym:
+                mk_to_months.setdefault(mk, set()).add(ym)
 
-        for mk in mk_set:
+        for mk, months in mk_to_months.items():
             try:
-                rebuild_feedback_md_for_model_in_dir(FEEDBACK_DIR_NAS, mk)
+                rebuild_feedback_md_for_model_months_in_dir(FEEDBACK_DIR_NAS, mk, months)
             except Exception:
                 pass
 
@@ -411,16 +499,6 @@ def map_csv_path(user_id: str) -> str:
 
 def ensure_user_dir(user_id: str) -> None:
     os.makedirs(user_dir(user_id), exist_ok=True)
-
-
-def atomic_write_csv(path: str, fieldnames: List[str], rows: List[Dict[str, str]]) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in fieldnames})
-    os.replace(tmp, path)
 
 
 def ensure_csv(path: str, fieldnames: List[str]) -> None:
@@ -524,15 +602,15 @@ def _write_last_prune(user_id: str, ymd: str) -> None:
 
 def prune_history_14days(user_id: str) -> None:
     ensure_all_csv(user_id)
-
     today = datetime.now().strftime("%Y-%m-%d")
     if _read_last_prune(user_id) == today:
         return
 
     cutoff = datetime.now() - timedelta(days=14)
 
+    path = history_csv_path(user_id)
     kept: List[Dict[str, str]] = []
-    with open(history_csv_path(user_id), newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
             ts = (row.get("timestamp") or "").strip()
@@ -559,7 +637,7 @@ def prune_history_14days(user_id: str) -> None:
                     "content": row.get("content") or "",
                 })
 
-    atomic_write_csv(history_csv_path(user_id), HISTORY_FIELDS, kept)
+    csv_write_dicts_atomic(path, HISTORY_FIELDS, kept)
     _write_last_prune(user_id, today)
 
 
@@ -569,7 +647,7 @@ def append_history(user_id: str, role: str, model_key: str, thread_id: str, dify
     with open(history_csv_path(user_id), "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([ts, role, model_key, thread_id, dify_cid or "", content])
-
+    _csv_cache().pop(f"read::{history_csv_path(user_id)}", None)
     prune_history_14days(user_id)
     return ts
 
@@ -578,65 +656,70 @@ def read_history(user_id: str, thread_id: Optional[str], limit: int = 200) -> Li
     if not thread_id:
         return []
     ensure_all_csv(user_id)
-    rows: List[Dict[str, str]] = []
-    with open(history_csv_path(user_id), newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if (row.get("thread_id") or "").strip() != thread_id:
-                continue
-            rows.append({
-                "timestamp": row.get("timestamp") or "",
-                "role": row.get("role") or "",
-                "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
-                "thread_id": thread_id,
-                "content": row.get("content") or "",
-            })
-    if len(rows) > limit:
-        rows = rows[-limit:]
-    return rows
+    path = history_csv_path(user_id)
+    rows = csv_read_dicts_cached(path, HISTORY_FIELDS)
+
+    out: List[Dict[str, str]] = []
+    tid = thread_id.strip()
+    for row in rows:
+        if (row.get("thread_id") or "").strip() != tid:
+            continue
+        out.append({
+            "timestamp": row.get("timestamp") or "",
+            "role": row.get("role") or "",
+            "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
+            "thread_id": tid,
+            "content": row.get("content") or "",
+        })
+
+    if len(out) > limit:
+        out = out[-limit:]
+    return out
 
 
 def read_history_all(user_id: str, thread_id: Optional[str]) -> List[Dict[str, str]]:
     if not thread_id:
         return []
     ensure_all_csv(user_id)
-    rows: List[Dict[str, str]] = []
-    with open(history_csv_path(user_id), newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if (row.get("thread_id") or "").strip() != thread_id:
-                continue
-            rows.append({
-                "timestamp": row.get("timestamp") or "",
-                "role": row.get("role") or "",
-                "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
-                "thread_id": thread_id,
-                "content": row.get("content") or "",
-            })
-    return rows
+    path = history_csv_path(user_id)
+    rows = csv_read_dicts_cached(path, HISTORY_FIELDS)
+
+    out: List[Dict[str, str]] = []
+    tid = thread_id.strip()
+    for row in rows:
+        if (row.get("thread_id") or "").strip() != tid:
+            continue
+        out.append({
+            "timestamp": row.get("timestamp") or "",
+            "role": row.get("role") or "",
+            "model_key": row.get("model_key") or DEFAULT_MODEL_KEY,
+            "thread_id": tid,
+            "content": row.get("content") or "",
+        })
+    return out
 
 
 def _load_threads(user_id: str) -> List[Dict[str, str]]:
     ensure_all_csv(user_id)
+    path = threads_csv_path(user_id)
+    rows = csv_read_dicts_cached(path, THREAD_FIELDS)
     out: List[Dict[str, str]] = []
-    with open(threads_csv_path(user_id), newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            tid = (row.get("thread_id") or "").strip()
-            if not tid:
-                continue
-            out.append({
-                "thread_id": tid,
-                "name": row.get("name") or "",
-                "preview": row.get("preview") or "",
-                "created_at": row.get("created_at") or "",
-                "updated_at": row.get("updated_at") or "",
-            })
+    for row in rows:
+        tid = (row.get("thread_id") or "").strip()
+        if not tid:
+            continue
+        out.append({
+            "thread_id": tid,
+            "name": row.get("name") or "",
+            "preview": row.get("preview") or "",
+            "created_at": row.get("created_at") or "",
+            "updated_at": row.get("updated_at") or "",
+        })
     return out
 
 
 def _save_threads(user_id: str, rows: List[Dict[str, str]]) -> None:
-    atomic_write_csv(threads_csv_path(user_id), THREAD_FIELDS, rows)
+    csv_write_dicts_atomic(threads_csv_path(user_id), THREAD_FIELDS, rows)
 
 
 def upsert_thread(user_id: str, thread_id: str, preview: str, updated_at: str) -> None:
@@ -702,7 +785,7 @@ def delete_thread(user_id: str, thread_id: str) -> bool:
                 "dify_conversation_id": (row.get("dify_conversation_id") or "").strip(),
                 "content": row.get("content") or "",
             })
-    atomic_write_csv(history_csv_path(user_id), HISTORY_FIELDS, kept)
+    csv_write_dicts_atomic(history_csv_path(user_id), HISTORY_FIELDS, kept)
 
     kept2: List[Dict[str, str]] = []
     with open(map_csv_path(user_id), newline="", encoding="utf-8") as f:
@@ -716,22 +799,23 @@ def delete_thread(user_id: str, thread_id: str) -> bool:
                 "dify_conversation_id": (row.get("dify_conversation_id") or "").strip(),
                 "updated_at": row.get("updated_at") or "",
             })
-    atomic_write_csv(map_csv_path(user_id), MAP_FIELDS, kept2)
+    csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, kept2)
+
     return True
 
 
 def _load_map(user_id: str) -> List[Dict[str, str]]:
     ensure_all_csv(user_id)
+    path = map_csv_path(user_id)
+    rows = csv_read_dicts_cached(path, MAP_FIELDS)
     out: List[Dict[str, str]] = []
-    with open(map_csv_path(user_id), newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            out.append({
-                "thread_id": (row.get("thread_id") or "").strip(),
-                "model_key": (row.get("model_key") or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY,
-                "dify_conversation_id": (row.get("dify_conversation_id") or "").strip(),
-                "updated_at": row.get("updated_at") or "",
-            })
+    for row in rows:
+        out.append({
+            "thread_id": (row.get("thread_id") or "").strip(),
+            "model_key": (row.get("model_key") or DEFAULT_MODEL_KEY).strip() or DEFAULT_MODEL_KEY,
+            "dify_conversation_id": (row.get("dify_conversation_id") or "").strip(),
+            "updated_at": row.get("updated_at") or "",
+        })
     return [x for x in out if x["thread_id"] and x["model_key"]]
 
 
@@ -749,7 +833,7 @@ def set_dify_cid(user_id: str, thread_id: str, model_key: str, dify_cid: str, up
         if r["thread_id"] == thread_id and r["model_key"] == model_key:
             r["dify_conversation_id"] = dify_cid
             r["updated_at"] = updated_at
-            atomic_write_csv(map_csv_path(user_id), MAP_FIELDS, rows)
+            csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, rows)
             return
     rows.append({
         "thread_id": thread_id,
@@ -757,7 +841,7 @@ def set_dify_cid(user_id: str, thread_id: str, model_key: str, dify_cid: str, up
         "dify_conversation_id": dify_cid,
         "updated_at": updated_at,
     })
-    atomic_write_csv(map_csv_path(user_id), MAP_FIELDS, rows)
+    csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, rows)
 
 
 def sse_pack(event: str, data_obj: Dict[str, Any]) -> str:
@@ -914,47 +998,6 @@ def api_history():
     return jsonify({"items": items})
 
 
-@app.get("/api/export")
-@api_login_required
-def api_export_csv():
-    u = load_user(session["user_id"])
-    if not u:
-        session.clear()
-        return jsonify({"error": "user not found"}), 401
-
-    tid = (request.args.get("thread_id") or "").strip()
-    if not tid:
-        return jsonify({"error": "thread_id is required"}), 400
-
-    threads = _load_threads(u["user_id"])
-    if not any(t["thread_id"] == tid for t in threads):
-        return jsonify({"error": "thread not found"}), 404
-
-    items = read_history_all(u["user_id"], tid)
-
-    sio = io.StringIO()
-    w = csv.writer(sio, lineterminator="\n")
-    w.writerow(["timestamp", "role", "model_key", "thread_id", "content"])
-    for m in items:
-        w.writerow([
-            m.get("timestamp", ""),
-            m.get("role", ""),
-            m.get("model_key", ""),
-            m.get("thread_id", ""),
-            m.get("content", ""),
-        ])
-
-    csv_text = "\ufeff" + sio.getvalue()
-    return Response(
-        csv_text,
-        mimetype="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition": 'attachment; filename="chat.csv"',
-            "Cache-Control": "no-store",
-        },
-    )
-
-
 @app.get("/api/threads")
 @api_login_required
 def api_threads():
@@ -1012,7 +1055,6 @@ def api_thread_delete():
 @app.get("/api/notice")
 @api_login_required
 def api_notice():
-    ensure_notice_file()
     try:
         st = os.stat(NOTICE_PATH)
         version = str(int(st.st_mtime))
@@ -1083,13 +1125,23 @@ def api_feedback():
             return jsonify({"error": "question/answer empty"}), 400
 
     saved_at = datetime.now().isoformat(timespec="seconds")
+    stored_to = "local"
 
     try:
-        # NASが復旧していたら、まずローカル退避分をNASへ同期（軽量ではないが、評価タイミングが最も安全）
         sync_local_spool_to_nas_if_possible()
-
-        # 書ける方へ保存（NAS優先、だめならローカル）
         target_dir = active_feedback_dir()
+        stored_to = "nas" if target_dir == FEEDBACK_DIR_NAS else "local"
+
+        prev_rows = load_feedback_state_merged()
+        prev_kind = "none"
+        prev_saved_at = ""
+        key = _feedback_key(u["user_id"], model_key, thread_id, bot_ts)
+        for r in prev_rows:
+            if _feedback_key(r.get("user_id", ""), r.get("model_key", ""), r.get("thread_id", ""), r.get("bot_ts", "")) == key:
+                prev_kind = (r.get("kind") or "none").strip().lower()
+                prev_saved_at = r.get("saved_at") or ""
+                break
+
         upsert_feedback_state_to_dir(
             dir_path=target_dir,
             user_id=u["user_id"],
@@ -1102,18 +1154,28 @@ def api_feedback():
             answer=str(answer),
         )
 
-        # md再生成（P0-2）：重いので一定間隔で間引く
-        with _rebuild_lock:
-            _dirty_models[model_key] = True
-            if should_rebuild_now(model_key):
-                rebuild_feedback_md_for_model_in_dir(target_dir, model_key)
-                _last_rebuild_at[model_key] = time.time()
-                _dirty_models[model_key] = False
+        if kind in ("good", "bad"):
+            ym = append_feedback_md(
+                dir_path=target_dir,
+                model_key=model_key,
+                kind=kind,
+                saved_at=saved_at,
+                user_id=u["user_id"],
+                question=str(question),
+                answer=str(answer),
+            )
+            if prev_kind in ("good", "bad") and prev_kind != kind:
+                mark_dirty_month(model_key, ym)
+        else:
+            ym_prev = _yyyymm_from_iso(prev_saved_at) if prev_saved_at else _yyyymm_from_iso(saved_at)
+            mark_dirty_month(model_key, ym_prev)
+
+        maybe_rebuild_dirty_months(target_dir, model_key)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    return jsonify({"ok": True, "kind": kind, "stored_to": "nas" if target_dir == FEEDBACK_DIR_NAS else "local"})
+    return jsonify({"ok": True, "kind": kind, "stored_to": stored_to})
 
 
 @app.post("/api/chat/stream")
@@ -1204,7 +1266,8 @@ def api_chat_stream():
         except Exception as e:
             yield sse_pack("error", {"message": str(e)})
 
-    return Response(generate(), mimetype="text/event-stream", headers={
+    # ★ここが修正点：stream_with_contextで包む
+    return Response(stream_with_context(generate()), mimetype="text/event-stream", headers={
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
         "X-Accel-Buffering": "no",
