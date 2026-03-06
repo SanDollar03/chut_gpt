@@ -270,7 +270,7 @@
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                kind, // "good" | "bad" | "none"
+                kind,
                 model_key: modelKey,
                 thread_id: threadId,
                 question,
@@ -283,7 +283,32 @@
         return data;
     }
 
-    function attachFeedbackUI({ bubble, modelKey, threadId, question, answer, botTs }) {
+    async function loadFeedbackStateMap({ threadId, modelKey }) {
+        if (!threadId) return new Map();
+        try {
+            const url = new URL("/api/feedback/state", location.origin);
+            url.searchParams.set("thread_id", threadId);
+            if (modelKey) url.searchParams.set("model_key", modelKey);
+
+            const res = await apiFetch(url.toString());
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) return new Map();
+
+            const m = new Map();
+            for (const it of (data.items || [])) {
+                const bt = String(it.bot_ts || "").trim();
+                const kd = String(it.kind || "").trim().toLowerCase();
+                if (!bt) continue;
+                if (kd !== "good" && kd !== "bad") continue;
+                m.set(bt, kd);
+            }
+            return m;
+        } catch {
+            return new Map();
+        }
+    }
+
+    function attachFeedbackUI({ bubble, modelKey, threadId, question, answer, botTs, initialKind }) {
         const bar = document.createElement("div");
         bar.className = "feedback-bar";
 
@@ -297,7 +322,7 @@
         down.className = "feedback-btn";
         down.textContent = "👎";
 
-        let state = "none"; // "good" | "bad" | "none"
+        let state = (initialKind === "good" || initialKind === "bad") ? initialKind : "none";
 
         const render = () => {
             up.classList.toggle("picked", state === "good");
@@ -378,7 +403,8 @@
                 threadId: feedback.threadId,
                 question: feedback.question,
                 answer: feedback.answer,
-                botTs: feedback.botTs
+                botTs: feedback.botTs,
+                initialKind: feedback.initialKind || "none"
             });
         }
 
@@ -443,6 +469,9 @@
             renderEmptyChat();
             return;
         }
+
+        const feedbackMap = await loadFeedbackStateMap({ threadId: activeThreadId, modelKey: currentModel });
+
         const url = new URL("/api/history", location.origin);
         url.searchParams.set("thread_id", activeThreadId);
 
@@ -473,12 +502,14 @@
 
             const botText = m.content || "";
             const qText = lastUserText || "";
+            const botTs = m.created_at || "";
+            const initialKind = feedbackMap.get(botTs) || "none";
 
             addMsg({
                 role: "bot",
                 text: botText,
                 modelKey: m.model_key,
-                timeISO: m.created_at,
+                timeISO: botTs,
                 showModelTag: true,
                 showTime: true,
                 feedback: {
@@ -486,7 +517,8 @@
                     modelKey: m.model_key,
                     question: qText,
                     answer: botText,
-                    botTs: m.created_at
+                    botTs: botTs,
+                    initialKind: initialKind
                 }
             });
         }
