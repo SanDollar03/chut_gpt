@@ -91,11 +91,18 @@ def ensure_dir(path: str) -> None:
 def ensure_notice_file() -> None:
     if os.path.exists(NOTICE_PATH):
         return
-    try:
-        with open(NOTICE_PATH, "w", encoding="utf-8") as f:
-            f.write("")
-    except Exception:
-        pass
+    lk = _lock_for_path(NOTICE_PATH)
+    with lk:
+        if os.path.exists(NOTICE_PATH):
+            return
+        try:
+            ensure_dir(os.path.dirname(NOTICE_PATH))
+            tmp = NOTICE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("")
+            os.replace(tmp, NOTICE_PATH)
+        except Exception:
+            pass
 
 
 def _csv_cache() -> Dict[str, Any]:
@@ -116,9 +123,11 @@ def csv_read_dicts_cached(path: str, fieldnames: List[str]) -> List[Dict[str, st
     with lk:
         if not os.path.exists(path):
             ensure_dir(os.path.dirname(path))
-            with open(path, "w", newline="", encoding="utf-8") as f:
+            tmp = path + ".tmp"
+            with open(tmp, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fieldnames)
                 w.writeheader()
+            os.replace(tmp, path)
 
         out: List[Dict[str, str]] = []
         with open(path, newline="", encoding="utf-8") as f:
@@ -159,9 +168,11 @@ def is_dir_writable(path: str) -> bool:
     try:
         ensure_dir(path)
         probe = os.path.join(path, ".write_test.tmp")
-        with open(probe, "w", encoding="utf-8") as f:
-            f.write("ok")
-        os.remove(probe)
+        lk = _lock_for_path(probe)
+        with lk:
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
         return True
     except Exception:
         return False
@@ -204,12 +215,17 @@ def map_csv_path(user_id: str) -> str:
 
 
 def ensure_csv(path: str, fieldnames: List[str]) -> None:
-    if os.path.exists(path):
-        return
-    ensure_dir(os.path.dirname(path))
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
+    lk = _lock_for_path(path)
+    with lk:
+        if os.path.exists(path):
+            return
+        ensure_dir(os.path.dirname(path))
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+        os.replace(tmp, path)
+    _csv_cache().pop(f"read::{path}", None)
 
 
 def ensure_all_user_csv(user_id: str) -> None:
@@ -228,9 +244,11 @@ def load_user(user_id: str) -> Optional[Dict[str, str]]:
     if not os.path.exists(p):
         return None
     ensure_all_user_csv(user_id)
-    with open(p, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        row = next(r, None)
+    lk = _lock_for_path(p)
+    with lk:
+        with open(p, newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            row = next(r, None)
     if not row:
         return None
 
@@ -249,17 +267,12 @@ def load_user(user_id: str) -> Optional[Dict[str, str]]:
 def save_user(u: Dict[str, str]) -> None:
     ensure_all_user_csv(u["user_id"])
     p = user_csv_path(u["user_id"])
-    lk = _lock_for_path(p)
-    with lk:
-        with open(p, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=USER_FIELDS)
-            w.writeheader()
-            w.writerow({
-                "user_id": u["user_id"],
-                "password": u.get("password", ""),
-                "model_key": u.get("model_key", DEFAULT_MODEL_KEY),
-                "created_at": u.get("created_at", ""),
-            })
+    csv_write_dicts_atomic(p, USER_FIELDS, [{
+        "user_id": u["user_id"],
+        "password": u.get("password", ""),
+        "model_key": u.get("model_key", DEFAULT_MODEL_KEY),
+        "created_at": u.get("created_at", ""),
+    }])
 
 
 def verify_user(user_id: str, password: str) -> bool:
@@ -270,17 +283,12 @@ def verify_user(user_id: str, password: str) -> bool:
 def create_user_files(user_id: str, password: str) -> None:
     ensure_all_user_csv(user_id)
     p = user_csv_path(user_id)
-    lk = _lock_for_path(p)
-    with lk:
-        with open(p, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=USER_FIELDS)
-            w.writeheader()
-            w.writerow({
-                "user_id": user_id,
-                "password": password,
-                "model_key": DEFAULT_MODEL_KEY,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            })
+    csv_write_dicts_atomic(p, USER_FIELDS, [{
+        "user_id": user_id,
+        "password": password,
+        "model_key": DEFAULT_MODEL_KEY,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }])
 
 
 def resolve_api_key(model_key: str) -> str:
@@ -294,20 +302,27 @@ def _last_prune_path(user_id: str) -> str:
 
 def _read_last_prune(user_id: str) -> str:
     p = _last_prune_path(user_id)
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return (f.read() or "").strip()
-    except Exception:
-        return ""
+    lk = _lock_for_path(p)
+    with lk:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return (f.read() or "").strip()
+        except Exception:
+            return ""
 
 
 def _write_last_prune(user_id: str, ymd: str) -> None:
     p = _last_prune_path(user_id)
-    try:
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(ymd)
-    except Exception:
-        pass
+    lk = _lock_for_path(p)
+    with lk:
+        try:
+            ensure_dir(os.path.dirname(p))
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(ymd)
+            os.replace(tmp, p)
+        except Exception:
+            pass
 
 
 def prune_history_14days(user_id: str) -> None:
@@ -319,18 +334,18 @@ def prune_history_14days(user_id: str) -> None:
     cutoff = datetime.now() - timedelta(days=14)
     path = history_csv_path(user_id)
 
+    rows = csv_read_dicts_cached(path, HISTORY_FIELDS)
+
     kept: List[Dict[str, str]] = []
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            ts = (row.get("timestamp") or "").strip()
-            try:
-                dt = datetime.fromisoformat(ts)
-            except Exception:
-                kept.append({k: row.get(k, "") for k in HISTORY_FIELDS})
-                continue
-            if dt >= cutoff:
-                kept.append({k: row.get(k, "") for k in HISTORY_FIELDS})
+    for row in rows:
+        ts = (row.get("timestamp") or "").strip()
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            kept.append({k: row.get(k, "") for k in HISTORY_FIELDS})
+            continue
+        if dt >= cutoff:
+            kept.append({k: row.get(k, "") for k in HISTORY_FIELDS})
 
     csv_write_dicts_atomic(path, HISTORY_FIELDS, kept)
     _write_last_prune(user_id, today)
@@ -452,23 +467,16 @@ def delete_thread(user_id: str, thread_id: str) -> bool:
         return False
     _save_threads(user_id, new_rows)
 
-    kept: List[Dict[str, str]] = []
-    with open(history_csv_path(user_id), newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if (row.get("thread_id") or "").strip() == thread_id:
-                continue
-            kept.append({k: row.get(k, "") for k in HISTORY_FIELDS})
-    csv_write_dicts_atomic(history_csv_path(user_id), HISTORY_FIELDS, kept)
+    # P1-5: 読み出しも csv_read_dicts_cached を使い、writeはatomicで統一
+    hist_path = history_csv_path(user_id)
+    hist_rows = csv_read_dicts_cached(hist_path, HISTORY_FIELDS)
+    kept_hist = [r for r in hist_rows if (r.get("thread_id") or "").strip() != thread_id]
+    csv_write_dicts_atomic(hist_path, HISTORY_FIELDS, kept_hist)
 
-    kept2: List[Dict[str, str]] = []
-    with open(map_csv_path(user_id), newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if (row.get("thread_id") or "").strip() == thread_id:
-                continue
-            kept2.append({k: row.get(k, "") for k in MAP_FIELDS})
-    csv_write_dicts_atomic(map_csv_path(user_id), MAP_FIELDS, kept2)
+    map_path = map_csv_path(user_id)
+    map_rows = csv_read_dicts_cached(map_path, MAP_FIELDS)
+    kept_map = [r for r in map_rows if (r.get("thread_id") or "").strip() != thread_id]
+    csv_write_dicts_atomic(map_path, MAP_FIELDS, kept_map)
 
     return True
 
@@ -523,11 +531,16 @@ def feedback_state_csv_path(dir_path: str) -> str:
 def ensure_feedback_state_csv(dir_path: str) -> None:
     ensure_dir(dir_path)
     path = feedback_state_csv_path(dir_path)
-    if os.path.exists(path):
-        return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=FEEDBACK_FIELDS)
-        w.writeheader()
+    lk = _lock_for_path(path)
+    with lk:
+        if os.path.exists(path):
+            return
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=FEEDBACK_FIELDS)
+            w.writeheader()
+        os.replace(tmp, path)
+    _csv_cache().pop(f"read::{path}", None)
 
 
 def _safe_filename_part(s: str) -> str:
@@ -723,11 +736,13 @@ def rebuild_feedback_md_for_model_months_in_dir(
     for ym in targets:
         for kd in ("good", "bad"):
             p = os.path.join(dir_path, f"{mk_safe}_{kd}_{ym}.md")
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
+            lk = _lock_for_path(p)
+            with lk:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
     for (kind, ym), lst in buckets.items():
         lst.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
@@ -924,6 +939,20 @@ def maybe_run_maintenance() -> None:
             return
         _last_maintenance_at = now
     maintenance_backup_and_rotation()
+
+
+def _compute_months_by_model(rows: List[Dict[str, str]]) -> Dict[str, Set[str]]:
+    out: Dict[str, Set[str]] = {}
+    for r in rows:
+        mk = (r.get("model_key") or "").strip()
+        kind = (r.get("kind") or "").strip().lower()
+        if not mk or kind not in ("good", "bad"):
+            continue
+        ym = _yyyymm_from_iso(r.get("saved_at", ""))
+        if not ym:
+            continue
+        out.setdefault(mk, set()).add(ym)
+    return out
 
 
 app = Flask(__name__)
@@ -1289,6 +1318,115 @@ def api_feedback():
         return jsonify({"error": str(e)}), 500
 
     return jsonify({"ok": True, "kind": kind, "stored_to": stored_to})
+
+
+# ---------------- P1-4: md再ビルド入口をAPI化 ----------------
+@app.post("/api/feedback/rebuild")
+@api_login_required
+def api_feedback_rebuild():
+    u = load_user(session["user_id"])
+    if not u:
+        session.clear()
+        return jsonify({"error": "user not found"}), 401
+
+    data = request.get_json(force=True) or {}
+
+    model_key = (data.get("model_key") or "").strip()
+    yyyymm = (data.get("yyyymm") or "").strip()
+    all_flag = bool(data.get("all"))
+
+    if model_key and model_key not in MODELS:
+        return jsonify({"error": "invalid model_key"}), 400
+
+    if yyyymm:
+        ym = re.sub(r"\D", "", yyyymm)[:6]
+        if len(ym) != 6:
+            return jsonify({"error": "invalid yyyymm (expected yyyymm)"}), 400
+        yyyymm = ym
+
+    try:
+        # 先に同期を試みる（NAS復旧時の整合もここで寄せる）
+        sync_local_spool_to_nas_if_possible()
+    except Exception:
+        pass
+
+    targets: List[Tuple[str, str, List[str]]] = []  # (dir, kind, details...)
+    rebuilt: List[Dict[str, Any]] = []
+
+    # 対象dirの決定（両方で動く）
+    dirs: List[str] = []
+    if is_nas_available_cached():
+        dirs.append(FEEDBACK_DIR_NAS)
+    if os.path.exists(feedback_state_csv_path(FEEDBACK_DIR_LOCAL)):
+        dirs.append(FEEDBACK_DIR_LOCAL)
+    if not dirs:
+        dirs = [FEEDBACK_DIR_LOCAL]
+
+    try:
+        for d in dirs:
+            ensure_feedback_state_csv(d)
+            rows = _load_feedback_state_from(d)
+
+            if all_flag:
+                mk_months = _compute_months_by_model(rows)
+                for mk, months in mk_months.items():
+                    try:
+                        rebuild_feedback_md_for_model_months_in_dir(d, mk, months)
+                        rebuilt.append({"dir": d, "model_key": mk, "months": sorted(list(months))})
+                    except Exception as e:
+                        rebuilt.append({"dir": d, "model_key": mk, "months": sorted(list(months)), "error": str(e)})
+                continue
+
+            # all でない場合
+            if model_key:
+                months: Set[str] = set()
+                if yyyymm:
+                    months = {yyyymm}
+                else:
+                    # 指定モデルの“存在する月”を全再生成
+                    for r in rows:
+                        if (r.get("model_key") or "").strip() != model_key:
+                            continue
+                        kd = (r.get("kind") or "").strip().lower()
+                        if kd not in ("good", "bad"):
+                            continue
+                        months.add(_yyyymm_from_iso(r.get("saved_at", "")))
+                    months.discard("")
+                if not months:
+                    rebuilt.append({"dir": d, "model_key": model_key, "months": [], "note": "no target months"})
+                    continue
+
+                rebuild_feedback_md_for_model_months_in_dir(d, model_key, months)
+                rebuilt.append({"dir": d, "model_key": model_key, "months": sorted(list(months))})
+                continue
+
+            # model_key未指定でyyyymmだけ指定 → その月に存在する全モデルを再生成
+            if yyyymm:
+                mk_months: Dict[str, Set[str]] = {}
+                for r in rows:
+                    kd = (r.get("kind") or "").strip().lower()
+                    if kd not in ("good", "bad"):
+                        continue
+                    ym = _yyyymm_from_iso(r.get("saved_at", ""))
+                    if ym != yyyymm:
+                        continue
+                    mk = (r.get("model_key") or "").strip()
+                    if mk:
+                        mk_months.setdefault(mk, set()).add(ym)
+
+                for mk, months in mk_months.items():
+                    rebuild_feedback_md_for_model_months_in_dir(d, mk, months)
+                    rebuilt.append({"dir": d, "model_key": mk, "months": sorted(list(months))})
+                if not mk_months:
+                    rebuilt.append({"dir": d, "model_key": "", "months": [yyyymm], "note": "no target models"})
+                continue
+
+            return jsonify({"error": "specify one of: all=true OR model_key OR yyyymm"}), 400
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True, "rebuilt": rebuilt})
 
 
 @app.post("/api/chat/stream")
