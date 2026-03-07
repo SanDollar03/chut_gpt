@@ -1,0 +1,21 @@
+.
+├─ app.py                        # 入口（thin）
+├─ config.py                     # 設定集約 + env検証
+├─ app/
+│  ├─ __init__.py                # create_app() + blueprint登録
+│  ├─ core.py                    # 共通ロジック（CSV/NAS/feedback/Dify SSE等）
+│  └─ blueprints/
+│     ├─ auth.py                 # /, /login, /register, /logout
+│     ├─ api_chat.py             # /api/chat/stream
+│     ├─ api_threads.py          # /api/models, /api/model, /api/threads... /api/notice
+│     └─ api_feedback.py         # /api/feedback, /api/feedback/state, /api/feedback/rebuild
+├─ tools/
+│  ├─ backup_rotate.py           # バックアップzip + 世代削除
+│  └─ nas_sync.py                # NAS復旧同期コマンド（スプール→NAS）
+├─ templates/
+│  ├─ index.html                 # 
+│  ├─ login.html                 #
+│  └─ register.html              #
+└─ static/
+   ├─ app.js                     #
+   └─ style.css                  #
