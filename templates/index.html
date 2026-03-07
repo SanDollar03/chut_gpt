@@ -32,6 +32,16 @@
             <div class="conv-head">
                 <div>あなたのチャット</div>
             </div>
+
+            <div class="conv-tools">
+                <input id="threadSearch" class="conv-search" type="search" placeholder="検索…" autocomplete="off" />
+                <select id="threadSort" class="conv-sort">
+                    <option value="updated_desc">新しい順</option>
+                    <option value="updated_asc">古い順</option>
+                    <option value="name_asc">名前順</option>
+                </select>
+            </div>
+
             <div id="convList" class="conv-list"></div>
 
             <div class="sidebar-meta">
@@ -54,6 +64,14 @@
                     <img class="topbar-banner" src="/static/banner.png" alt="ChuっとGPT" />
                 </div>
             </header>
+
+            <div id="errorBanner" class="error-banner" hidden>
+                <div id="errorBannerText" class="error-banner-text"></div>
+                <button id="errorBannerClose" class="error-banner-close"
+                    onclick="document.getElementById('errorBanner').hidden=true;">
+                    閉じる
+                </button>
+            </div>
 
             <main id="chat" class="chat"></main>
 
