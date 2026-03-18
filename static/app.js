@@ -496,7 +496,7 @@
         chat.innerHTML = "";
         addMsg({
             role: "bot",
-            text: "ぼくはChuっとGPTです💋 学習データの中から回答します。質問前に「現在のモデル」を確認してね！",
+            text: "ぼくはCHUPPYっす💋 学習データの中から回答するっす！質問前に「現在のモデル」を確認してね！",
             modelKey: currentModel,
             timeISO: "",
             showModelTag: true,
